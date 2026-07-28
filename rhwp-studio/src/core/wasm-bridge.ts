@@ -462,6 +462,43 @@ export class WasmBridge {
     return (this.doc as any).insertPageBreak(sec, para, charOffset);
   }
 
+  /** 표 문단과 쪽 나누기 문단 사이의 빈 문단을 제거(한컴 빈 페이지 방지). */
+  removeOrphanParasBeforePageBreaks(sec: number): { removed: number } {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse(
+      (this.doc as unknown as { removeOrphanParasBeforePageBreaks: (s: number) => string })
+        .removeOrphanParasBeforePageBreaks(sec),
+    );
+  }
+
+  /** 원본 양식(샘플) 표 + 바로 뒤 쪽 나누기 제거(양식 이어쓰기 후 빈 샘플 정리). */
+  removeSourceFormTable(sec: number, para: number, controlIdx: number): { removedBreak: boolean } {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse(
+      (this.doc as unknown as {
+        removeSourceFormTable: (s: number, p: number, c: number) => string;
+      }).removeSourceFormTable(sec, para, controlIdx),
+    );
+  }
+
+  /** 구역 끝 '마지막 표 뒤' 빈 문단들을 제거(문서 끝 빈 페이지 방지). */
+  trimTrailingParasAfterLastTable(sec: number): { removed: number } {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse(
+      (this.doc as unknown as { trimTrailingParasAfterLastTable: (s: number) => string })
+        .trimTrailingParasAfterLastTable(sec),
+    );
+  }
+
+  /** 항목 표 위 빈 선행 문단을 최소 높이로 압축(한컴에서 항목이 다음 페이지로 밀림 방지). */
+  compactLeadingParasBeforeTables(sec: number): { compacted: number } {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse(
+      (this.doc as unknown as { compactLeadingParasBeforeTables: (s: number) => string })
+        .compactLeadingParasBeforeTables(sec),
+    );
+  }
+
   insertColumnBreak(sec: number, para: number, charOffset: number): string {
     if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
     return (this.doc as any).insertColumnBreak(sec, para, charOffset);
@@ -817,6 +854,26 @@ export class WasmBridge {
                 extension: string, description: string = ''): { ok: boolean; paraIdx: number; controlIdx: number } {
     if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
     return JSON.parse(this.doc.insertPicture(sec, paraIdx, charOffset, imageData, width, height, naturalWidthPx, naturalHeightPx, extension, description));
+  }
+
+  /** 표 셀 안에 그림을 넣는다(insertPicture의 셀 버전). 셀 paragraphs[cellParaIdx] 위치에 삽입. */
+  insertPictureInCell(sec: number, parentPara: number, controlIdx: number, cellIdx: number,
+                      cellParaIdx: number, imageData: Uint8Array, width: number, height: number,
+                      naturalWidthPx: number, naturalHeightPx: number,
+                      extension: string, description: string = ''): { ok: boolean } {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse((this.doc as unknown as { insertPictureInCell: (...a: unknown[]) => string }).insertPictureInCell(
+      sec, parentPara, controlIdx, cellIdx, cellParaIdx, imageData, width, height,
+      naturalWidthPx, naturalHeightPx, extension, description));
+  }
+
+  /** 표 셀 안에 중첩 표를 만들어 넣는다(본문 데이터 표). cellTextsJson=셀 텍스트 JSON 배열. */
+  createTableInCell(sec: number, parentPara: number, controlIdx: number, cellIdx: number,
+                    cellParaIdx: number, rows: number, cols: number,
+                    cellTextsJson: string): { ok: boolean } {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse((this.doc as unknown as { createTableInCell: (...a: unknown[]) => string }).createTableInCell(
+      sec, parentPara, controlIdx, cellIdx, cellParaIdx, rows, cols, cellTextsJson));
   }
 
   // ── 그림 속성 API ─────────────────────────────────────

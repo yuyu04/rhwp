@@ -1119,7 +1119,211 @@ impl DocumentCore {
     }
 
     /// 표 속성을 수정한다 (네이티브).
-    pub(crate) fn set_table_properties_native(
+    /// 여러 페이지에 걸친 목차 표(떠있는 tac=false 표)를 '페이지별 개별 표'로 쪼갠다.
+    ///
+    /// 한컴은 다중 페이지에 걸친 떠있는 표 뒤에 빈 페이지를 끼운다(연구노트 첫 항목이 한 페이지
+    /// 밀림). 항목 표(각 한 페이지에 들어가는 개별 표)는 멀쩡하므로, 목차도 같은 패턴으로
+    /// 바꾼다: 머리글(행 0)을 반복하며 데이터 행을 `rows_per_chunk`씩 끊어 N개의 개별 표로
+    /// 만들고, 두 번째 표부터 쪽 나눔으로 각 페이지에 둔다. 한 표가 페이지를 넘지 않으므로
+    /// 떠있는 다중 페이지 표가 사라져 빈 페이지가 없어진다. 셀 스타일(테두리·배경·글꼴)은
+    /// 원본을 복제해 보존한다. 직렬화는 row_count/cells를 모델에서 재생성한다.
+    pub fn rechunk_toc_table_native(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        control_idx: usize,
+        rows_per_chunk: usize,
+    ) -> Result<String, HwpError> {
+        use crate::model::control::Control;
+        use crate::model::table::TablePageBreak;
+
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError("구역 범위 초과".into()));
+        }
+        if para_idx >= self.document.sections[section_idx].paragraphs.len() {
+            return Err(HwpError::RenderError("문단 범위 초과".into()));
+        }
+        let rows_per_chunk = rows_per_chunk.max(1);
+
+        // 원본 표 + 그 표를 담은 문단(템플릿)을 복제한다.
+        let original = {
+            let para = &self.document.sections[section_idx].paragraphs[para_idx];
+            match para.controls.get(control_idx) {
+                Some(Control::Table(t)) => (**t).clone(),
+                _ => return Err(HwpError::RenderError("대상이 표가 아닙니다".into())),
+            }
+        };
+        let row_count = original.row_count as usize;
+        if row_count < 2 {
+            return Ok(super::super::helpers::json_ok_with("\"chunks\":0"));
+        }
+        let data_rows = row_count - 1; // 행 0 = 머리글
+        // 한 청크에 다 들어가면 쪼갤 필요 없음.
+        if data_rows <= rows_per_chunk {
+            return Ok(super::super::helpers::json_ok_with("\"chunks\":1"));
+        }
+        let template_para = self.document.sections[section_idx].paragraphs[para_idx].clone();
+
+        // 데이터 행을 청크로 끊는다(행 인덱스, 1-기준 데이터).
+        let mut chunks: Vec<(usize, usize)> = Vec::new(); // [start_row, end_row)
+        let mut s = 1usize;
+        while s <= data_rows {
+            let e = (s + rows_per_chunk).min(row_count);
+            chunks.push((s, e));
+            s = e;
+        }
+
+        // 각 청크 표 = 원본 복제 후 '머리글(0) + [start,end)' 외 행 삭제.
+        let mut new_paras = Vec::with_capacity(chunks.len());
+        for (k, &(cs, ce)) in chunks.iter().enumerate() {
+            let mut t = original.clone();
+            // 삭제할 행 = [1, cs) ∪ [ce, row_count). 인덱스 안정성을 위해 내림차순 삭제.
+            let mut to_delete: Vec<usize> = Vec::new();
+            for r in 1..row_count {
+                if r < cs || r >= ce {
+                    to_delete.push(r);
+                }
+            }
+            for r in to_delete.into_iter().rev() {
+                let _ = t.delete_row(r as u16);
+            }
+            t.rebuild_grid();
+            // 각 청크는 한 페이지에 들어가므로 표 자체 분할은 끈다(attr 재생성 유도).
+            t.page_break = TablePageBreak::None;
+            t.raw_table_record_attr = 0;
+
+            let mut p = template_para.clone();
+            // 표 컨트롤 교체.
+            if let Some(slot) = p.controls.get_mut(control_idx) {
+                *slot = Control::Table(Box::new(t));
+            }
+            // line_seg는 원본(큰 표) 기준이라 무효 — 비워 재계산을 유도한다.
+            p.line_segs.clear();
+            // 둘째 청크부터 쪽 나눔으로 새 페이지에서 시작.
+            p.column_type = if k == 0 {
+                template_para.column_type
+            } else {
+                crate::model::paragraph::ColumnBreakType::Page
+            };
+            p.raw_break_type = 0;
+            new_paras.push(p);
+        }
+
+        // 원본 표 문단을 청크 문단들로 교체.
+        let n = new_paras.len();
+        self.document.sections[section_idx]
+            .paragraphs
+            .splice(para_idx..=para_idx, new_paras);
+
+        self.document.sections[section_idx].raw_stream = None;
+        self.mark_section_dirty(section_idx);
+        self.recompose_section(section_idx);
+        self.invalidate_page_tree_cache();
+        // line_seg 재계산(빈 것 채움) 후 페이지네이션.
+        self.reflow_linesegs_on_demand();
+
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"chunks\":{}",
+            n
+        )))
+    }
+
+    /// 목차 표의 '쪽번호' 열을 각 항목이 실제로 시작하는 쪽번호로 다시 매긴다.
+    ///
+    /// 항목 표가 분할(셀 단위 쪽나눔)되어 한 항목이 여러 페이지를 차지하면, 뒤 항목들의
+    /// 실제 쪽번호가 밀린다(예: 항목22가 22~23쪽 → 다음 항목은 23이 아니라 24쪽). 목차의
+    /// 첫 열은 단순 일련번호가 아니라 '쪽번호'이므로, 페이지네이션 결과에서 각 항목 표가
+    /// 시작하는 페이지의 (구역 상대) page_number를 읽어 목차 데이터 행을 갱신한다.
+    ///
+    /// 항목 표 = 6×3 표(문서 순서). 목차 표 = (toc_section,toc_para,toc_ctrl). 목차 데이터 행
+    /// 순서와 항목 순서가 1:1 대응한다고 본다(양식 변환이 그 순서를 보장).
+    pub fn sync_toc_page_numbers_native(
+        &mut self,
+        toc_section: usize,
+        toc_para: usize,
+        toc_ctrl: usize,
+    ) -> Result<String, HwpError> {
+        use crate::model::control::Control;
+        use crate::renderer::pagination::PageItem;
+        use std::collections::HashMap;
+
+        self.paginate();
+
+        // (구역, 문단) → 그 문단이 처음 나타나는 페이지의 표시 쪽번호.
+        let mut start_page: HashMap<(usize, usize), u32> = HashMap::new();
+        for pr in &self.pagination {
+            for page in &pr.pages {
+                let sec = page.section_index;
+                let pn = page.page_number;
+                for col in &page.column_contents {
+                    for item in &col.items {
+                        let pi = match item {
+                            PageItem::FullParagraph { para_index, .. }
+                            | PageItem::PartialParagraph { para_index, .. }
+                            | PageItem::Table { para_index, .. }
+                            | PageItem::PartialTable { para_index, .. } => Some(*para_index),
+                            _ => None,
+                        };
+                        if let Some(pi) = pi {
+                            start_page.entry((sec, pi)).or_insert(pn);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 항목 표(6×3)의 시작 쪽번호를 문서 순서대로 모은다.
+        let mut entry_pages: Vec<u32> = Vec::new();
+        for (si, s) in self.document.sections.iter().enumerate() {
+            for (pi, p) in s.paragraphs.iter().enumerate() {
+                if p
+                    .controls
+                    .iter()
+                    .any(|c| matches!(c, Control::Table(t) if t.row_count == 6 && t.col_count == 3))
+                {
+                    entry_pages.push(*start_page.get(&(si, pi)).unwrap_or(&0));
+                }
+            }
+        }
+
+        // 목차 데이터 행(첫 열, row≥1)의 셀 인덱스를 행 순으로 모은다.
+        let mut row_cells: Vec<(u16, usize)> = {
+            let table = self.get_table_mut(toc_section, toc_para, toc_ctrl)?;
+            table
+                .cells
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.col == 0 && c.row >= 1)
+                .map(|(idx, c)| (c.row, idx))
+                .collect()
+        };
+        row_cells.sort_by_key(|(r, _)| *r);
+
+        // 각 데이터 행의 첫 셀 텍스트를 실제 쪽번호로 교체(기존 셀 글자모양 재사용 — 안전).
+        let n = row_cells.len().min(entry_pages.len());
+        for i in 0..n {
+            let cell_idx = row_cells[i].1;
+            let num = entry_pages[i].to_string();
+            let len =
+                self.get_cell_paragraph_length_native(toc_section, toc_para, toc_ctrl, cell_idx, 0)?;
+            if len > 0 {
+                self.delete_text_in_cell_native(
+                    toc_section, toc_para, toc_ctrl, cell_idx, 0, 0, len,
+                )?;
+            }
+            self.insert_text_in_cell_native(
+                toc_section, toc_para, toc_ctrl, cell_idx, 0, 0, &num,
+            )?;
+        }
+
+        self.paginate();
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"synced\":{}",
+            n
+        )))
+    }
+
+    pub fn set_table_properties_native(
         &mut self,
         section_idx: usize,
         parent_para_idx: usize,
@@ -1156,10 +1360,32 @@ impl DocumentCore {
             table.repeat_header = v;
         }
         if let Some(v) = json_bool(json, "treatAsChar") {
+            // 글자처럼취급(treat_as_char)은 CommonObjAttr.attr 비트 0 이다.
+            // 3곳을 모두 동기화해야 한다:
+            //  - common.treat_as_char / common.attr : 렌더·페이지네이션이 보는 값
+            //  - raw_ctrl_data[0..4] : .hwp 직렬화(serialize_table)가 무손실로 그대로
+            //    재사용하는 CommonObjAttr 원본 바이트 — 여기를 안 고치면 저장 시 옛 값으로
+            //    되돌아가 한컴에서 글자처럼취급 표가 페이지 경계에서 안 나뉘고 클립된다.
+            // (주의: table.attr 은 TABLE 레코드 attr 로 treat_as_char 와 무관하므로 건드리지 않는다.)
+            table.common.treat_as_char = v;
             if v {
-                table.attr |= 0x01;
+                table.common.attr |= 0x01;
             } else {
-                table.attr &= !0x01;
+                table.common.attr &= !0x01;
+            }
+            if table.raw_ctrl_data.len() >= 4 {
+                let mut a = u32::from_le_bytes([
+                    table.raw_ctrl_data[0],
+                    table.raw_ctrl_data[1],
+                    table.raw_ctrl_data[2],
+                    table.raw_ctrl_data[3],
+                ]);
+                if v {
+                    a |= 0x01;
+                } else {
+                    a &= !0x01;
+                }
+                table.raw_ctrl_data[0..4].copy_from_slice(&a.to_le_bytes());
             }
         }
 
@@ -1593,6 +1819,99 @@ impl DocumentCore {
     ///
     /// 확장 컨트롤은 para.text에 포함되지 않고 char_offsets 간의 갭(8 code unit)에 배치된다.
     /// 컨트롤 제거 시 해당 갭을 닫기 위해 후속 char_offsets를 8씩 감소시킨다.
+    /// 원본 양식(샘플) 표를 제거하고, 바로 뒤 '쪽 나누기' 문단도 함께 제거한다.
+    ///
+    /// 양식 이어쓰기는 원본 양식 표를 항목마다 복제하므로 원본은 빈 샘플로 남는다. 그 표만
+    /// 지우면(문단은 구역정의/머리말을 담고 있어 보존) 그 자리에 빈 페이지가 남고, 표 뒤의
+    /// 쪽 나누기가 첫 항목을 다음 페이지로 밀어낸다. 따라서 표 제거 후 바로 뒤 문단이 쪽
+    /// 나누기면 함께 제거해 첫 항목이 첫 페이지에서 시작하게 한다. 반환: `{"removedBreak":bool}`
+    pub fn remove_source_form_table_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+    ) -> Result<String, HwpError> {
+        use crate::model::paragraph::ColumnBreakType;
+        // 1) 표 컨트롤 제거(검증 + char_offset 정리 + recompose 포함).
+        self.delete_table_control_native(section_idx, parent_para_idx, control_idx)?;
+        // 2) 표 바로 뒤 문단이 쪽 나누기면 제거.
+        let next_is_page_break = self
+            .document
+            .sections
+            .get(section_idx)
+            .and_then(|s| s.paragraphs.get(parent_para_idx + 1))
+            .map(|p| matches!(p.column_type, ColumnBreakType::Page))
+            .unwrap_or(false);
+        if next_is_page_break {
+            self.delete_paragraph_native(section_idx, parent_para_idx + 1)?;
+        }
+        // 3) 앵커가 '구역 시작의 보이는 내용 없는 문단'으로 남고 다음 문단이 표 하나만 가지면,
+        //    그 표를 앵커 문단으로 흡수하고 다음 문단을 제거한다 — 원본 템플릿의 형태 복원
+        //    (소스 표는 구역 시작 문단에 있었다). 흡수하지 않으면 빈 앵커 문단의 한 줄 때문에
+        //    페이지를 거의 꽉 채우는 첫 항목 표가 한컴에서 다음 페이지로 밀려, 목차 뒤에
+        //    빈 페이지처럼 보이는 페이지가 생긴다(hop 뷰어는 흡수해 안 보임 — 2026-07 실측).
+        //    글자모양/문단모양을 새로 만들지 않는 순수 이동·삭제다(DocInfo 추가는 한컴이
+        //    '파일 손상'으로 거부한 전례가 있어 금지 — compact_leading_paras 참조).
+        let mut absorbed = false;
+        if parent_para_idx == 0 {
+            use crate::model::control::Control;
+            let can_absorb = {
+                let ps = &self.document.sections[section_idx].paragraphs;
+                let anchor_ok = ps.first().is_some_and(|p| {
+                    p.text.trim().is_empty()
+                        && !p.controls.iter().any(|c| {
+                            matches!(c, Control::Table(_) | Control::Picture(_) | Control::Shape(_))
+                        })
+                });
+                let next_ok = ps.get(1).is_some_and(|p| {
+                    p.text.trim().is_empty()
+                        && p.controls.len() == 1
+                        && matches!(p.controls[0], Control::Table(_))
+                });
+                anchor_ok && next_ok
+            };
+            if can_absorb {
+                let (ctrl, data) = {
+                    let next = &mut self.document.sections[section_idx].paragraphs[1];
+                    let ctrl = next.controls.remove(0);
+                    let data = if next.ctrl_data_records.is_empty() {
+                        None
+                    } else {
+                        next.ctrl_data_records.remove(0)
+                    };
+                    // 표를 뺐으니 문단 부기(확장 컨트롤 8 code unit + 마스크)도 되돌린다 —
+                    // 바로 아래에서 삭제되지만, 삭제 전 재조판이 일관된 모델을 보게 한다.
+                    if next.char_count >= 8 {
+                        next.char_count -= 8;
+                    }
+                    next.control_mask &= !(1u32 << 0x000B);
+                    (ctrl, data)
+                };
+                {
+                    let anchor = &mut self.document.sections[section_idx].paragraphs[0];
+                    // ctrl_data_records는 controls와 병렬 — 길이를 맞춘 뒤 push한다.
+                    while anchor.ctrl_data_records.len() < anchor.controls.len() {
+                        anchor.ctrl_data_records.push(None);
+                    }
+                    anchor.controls.push(ctrl);
+                    anchor.ctrl_data_records.push(data);
+                    anchor.char_count += 8; // 확장 컨트롤(표) = 8 code unit.
+                    anchor.control_mask |= 1u32 << 0x000B;
+                }
+                self.document.sections[section_idx].raw_stream = None;
+                self.delete_paragraph_native(section_idx, 1)?;
+                self.recompose_section(section_idx);
+                absorbed = true;
+            }
+        }
+        self.invalidate_page_tree_cache();
+        self.paginate_if_needed();
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"removedBreak\":{},\"absorbedFirstTable\":{}",
+            next_is_page_break, absorbed
+        )))
+    }
+
     pub fn delete_table_control_native(
         &mut self,
         section_idx: usize,

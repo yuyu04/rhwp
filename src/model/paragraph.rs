@@ -432,6 +432,15 @@ impl Paragraph {
                 cs.start_pos = utf16_start;
             }
         }
+        // 3-1. 클램핑으로 여러 char_shape 가 같은 start_pos 로 겹치면 첫 ref 만 남긴다.
+        // 안 그러면 삭제된 런의 글자모양이 뒤 ref 로 잔존한다 — 예: 양식 채우기에서 셀
+        // 텍스트를 전부 지운 뒤 다시 채우면, 템플릿의 보조 런(작은 글씨)이 위치 0 으로
+        // 겹쳐 새로 넣은 텍스트 일부가 작은 글씨로 렌더된다(기록일자 날짜가 확인일자보다
+        // 작게 보이던 문제). char_shapes 는 start_pos 가 유일·증가해야 정상이다.
+        {
+            let mut seen = std::collections::HashSet::new();
+            self.char_shapes.retain(|cs| seen.insert(cs.start_pos));
+        }
 
         // 4. line_segs: 삭제 범위 이후 → utf16_delta만큼 감소
         for ls in &mut self.line_segs {

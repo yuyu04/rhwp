@@ -21585,3 +21585,145 @@ fn test_reflow_linesegs_empty_document_returns_zero() {
     let count = doc.reflow_linesegs();
     assert_eq!(count, 0);
 }
+
+/// 최소 PNG 바이트(시그니처+IHDR)를 만든다 — decode_image_px가 픽셀 크기를 읽을 수 있는
+/// 헤더만 갖추면 되므로(삽입은 바이트 유효성을 더 검사하지 않음) 본문 청크는 생략한다.
+fn fake_png_bytes(w: u32, h: u32) -> Vec<u8> {
+    let mut d = vec![0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    d.extend_from_slice(&13u32.to_be_bytes()); // IHDR 길이
+    d.extend_from_slice(b"IHDR");
+    d.extend_from_slice(&w.to_be_bytes());
+    d.extend_from_slice(&h.to_be_bytes());
+    d.extend_from_slice(&[8, 6, 0, 0, 0]); // bit depth/color type 등
+    d
+}
+
+/// 셀 그림 삽입 크기 검증 헬퍼 — (0,0) 셀 높이를 60000HU로 키운 표에 그림을 넣고
+/// 삽입된 Picture의 표시 크기(common.width/height)를 돌려준다.
+fn insert_cell_picture_and_get_size(png: &[u8], req_w: u32) -> (u32, u32) {
+    use crate::model::control::Control;
+
+    let mut doc = create_doc_with_table();
+    if let Some(Control::Table(t)) = doc.document.sections[0].paragraphs[0].controls.get_mut(0) {
+        t.cells[0].height = 60000;
+    } else {
+        panic!("테스트 표가 없음");
+    }
+    doc.insert_picture_in_cell_native(0, 0, 0, 0, 1, png, req_w, 1, 1, 1, "png", "")
+        .expect("셀 그림 삽입 실패");
+    if let Some(Control::Table(t)) = doc.document.sections[0].paragraphs[0].controls.get(0) {
+        for p in &t.cells[0].paragraphs {
+            for c in &p.controls {
+                if let Control::Picture(pic) = c {
+                    return (pic.common.width, pic.common.height);
+                }
+            }
+        }
+    }
+    panic!("삽입된 그림을 찾지 못함");
+}
+
+#[test]
+fn test_insert_picture_in_cell_keeps_normal_landscape_size() {
+    // 일반 가로 그림(비율 0.5): 폭 41160 → 높이 20580. 셀 높이 60000의 60% 상한(36000)
+    // 아래이므로 축소 없이 요청 크기 그대로 들어가야 한다. (30% 상한(18000) 시절에는
+    // 이 그림도 축소돼 "그림이 작다" 회귀가 났다 — 2026-07 연구노트 실측.)
+    let png = fake_png_bytes(200, 100);
+    let (w, h) = insert_cell_picture_and_get_size(&png, 41160);
+    assert_eq!(w, 41160, "가로 그림 폭이 축소되면 안 됨");
+    assert_eq!(h, 20580, "높이는 실제 비율(0.5)로 산출");
+}
+
+#[test]
+fn test_insert_picture_in_cell_clamps_extremely_tall_image() {
+    // 세로로 극단적으로 긴 그림(비율 2.0): 폭 41160 → 높이 82320 > 상한 36000.
+    // 높이를 상한으로 줄이고 폭도 비율 유지 축소해야 한다(셀 넘침 방지 가드는 유지).
+    let png = fake_png_bytes(100, 200);
+    let (w, h) = insert_cell_picture_and_get_size(&png, 41160);
+    assert_eq!(h, 36000, "세로 긴 그림은 셀 높이 60% 상한으로 클램프");
+    assert_eq!(w, 18000, "폭은 비율(0.5배) 유지 축소");
+}
+
+/// remove_source_form_table 이후 첫 항목 표 흡수 + 구역 끝 빈 문단 정리 검증(빈 페이지 방지).
+#[test]
+fn test_remove_source_form_table_absorbs_first_entry_table_into_anchor() {
+    use crate::model::control::Control;
+    use crate::model::paragraph::ColumnBreakType;
+
+    let mut doc = create_doc_with_table(); // p0 = 소스 표를 가진 구역 시작 문단.
+    {
+        let d = &mut doc.document;
+        let table2 = {
+            // p0의 표를 복제해 '첫 항목 표'로 쓴다(구조 동일하면 충분).
+            match &d.sections[0].paragraphs[0].controls[0] {
+                Control::Table(t) => Control::Table(t.clone()),
+                _ => panic!("테스트 표가 없음"),
+            }
+        };
+        // p1: 쪽 나누기 문단(소스 표 뒤). p2: 첫 항목 표 문단. p3: 끝 빈 쪽나눔 문단.
+        let pb = Paragraph {
+            text: String::new(),
+            column_type: ColumnBreakType::Page,
+            ..Default::default()
+        };
+        let entry_para = Paragraph {
+            text: String::new(),
+            char_count: 9,
+            control_mask: 1u32 << 0x000B,
+            controls: vec![table2],
+            ctrl_data_records: vec![None],
+            ..Default::default()
+        };
+        let trailing = Paragraph {
+            text: String::new(),
+            column_type: ColumnBreakType::Page,
+            ..Default::default()
+        };
+        d.sections[0].paragraphs.push(pb);
+        d.sections[0].paragraphs.push(entry_para);
+        d.sections[0].paragraphs.push(trailing);
+    }
+
+    // 소스 표 제거 → 뒤 쪽나눔 문단 제거 → 첫 항목 표를 구역 시작 문단(p0)으로 흡수.
+    let json = doc.remove_source_form_table_native(0, 0, 0).expect("소스 표 제거 실패");
+    assert!(json.contains("\"absorbedFirstTable\":true"), "흡수돼야 함: {}", json);
+
+    let sec = &doc.document.sections[0];
+    assert!(
+        sec.paragraphs[0].controls.iter().any(|c| matches!(c, Control::Table(_))),
+        "첫 항목 표가 구역 시작 문단에 있어야 함"
+    );
+    assert_eq!(sec.paragraphs.len(), 2, "p0(표) + 끝 빈 문단만 남아야 함");
+
+    // 구역 끝 빈 쪽나눔 문단 정리 → 표 문단으로 구역이 끝난다(끝 빈 페이지 방지).
+    let json = doc.trim_trailing_paras_after_last_table_native(0).expect("끝 문단 정리 실패");
+    assert!(json.contains("\"removed\":1"), "끝 빈 문단 1개 제거: {}", json);
+    assert_eq!(doc.document.sections[0].paragraphs.len(), 1);
+}
+
+/// 마지막 표 뒤에 '보이는 내용' 문단이 있으면 아무것도 지우지 않는다(본문 훼손 금지).
+#[test]
+fn test_trim_trailing_keeps_visible_content_after_table() {
+    use crate::model::paragraph::ColumnBreakType;
+
+    let mut doc = create_doc_with_table();
+    {
+        let d = &mut doc.document;
+        let visible = Paragraph {
+            text: "맺음말".to_string(),
+            char_count: 4,
+            char_offsets: make_char_offsets("맺음말"),
+            ..Default::default()
+        };
+        let trailing_pb = Paragraph {
+            text: String::new(),
+            column_type: ColumnBreakType::Page,
+            ..Default::default()
+        };
+        d.sections[0].paragraphs.push(visible);
+        d.sections[0].paragraphs.push(trailing_pb);
+    }
+    let json = doc.trim_trailing_paras_after_last_table_native(0).expect("호출 실패");
+    assert!(json.contains("\"removed\":0"), "본문이 있으면 0개 제거: {}", json);
+    assert_eq!(doc.document.sections[0].paragraphs.len(), 3);
+}

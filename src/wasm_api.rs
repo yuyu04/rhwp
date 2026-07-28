@@ -1198,6 +1198,37 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// 표 문단과 쪽 나누기 문단 사이의 빈 문단을 제거(한컴 빈 페이지 방지). 반환: `{"removed":N}`
+    #[wasm_bindgen(js_name = removeOrphanParasBeforePageBreaks)]
+    pub fn remove_orphan_paras_before_page_breaks(
+        &mut self,
+        section_idx: u32,
+    ) -> Result<String, JsValue> {
+        self.remove_orphan_paras_before_page_breaks_native(section_idx as usize)
+            .map_err(|e| e.into())
+    }
+
+    /// 구역 끝 '마지막 표 뒤' 빈 문단들을 제거(문서 끝 빈 페이지 방지). 반환: `{"removed":N}`
+    #[wasm_bindgen(js_name = trimTrailingParasAfterLastTable)]
+    pub fn trim_trailing_paras_after_last_table(
+        &mut self,
+        section_idx: u32,
+    ) -> Result<String, JsValue> {
+        self.trim_trailing_paras_after_last_table_native(section_idx as usize)
+            .map_err(|e| e.into())
+    }
+
+    /// 항목 표 위 빈 선행 문단을 최소 높이로 압축(한컴에서 항목이 다음 페이지로 밀리는 것
+    /// 방지 — 표가 페이지 상단 가까이서 시작하도록 여백 확보). 반환: `{"compacted":N}`
+    #[wasm_bindgen(js_name = compactLeadingParasBeforeTables)]
+    pub fn compact_leading_paras_before_tables(
+        &mut self,
+        section_idx: u32,
+    ) -> Result<String, JsValue> {
+        self.compact_leading_paras_before_tables_native(section_idx as usize)
+            .map_err(|e| e.into())
+    }
+
     /// 단 나누기 삽입 (Ctrl+Shift+Enter)
     #[wasm_bindgen(js_name = insertColumnBreak)]
     pub fn insert_column_break(
@@ -2087,6 +2118,52 @@ impl HwpDocument {
         .map_err(|e| e.into())
     }
 
+    /// 원본 양식(샘플) 표 + 바로 뒤 쪽 나누기 제거. 반환: `{"removedBreak":bool}`
+    #[wasm_bindgen(js_name = removeSourceFormTable)]
+    pub fn remove_source_form_table(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+    ) -> Result<String, JsValue> {
+        self.remove_source_form_table_native(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 표 셀 안에 중첩 표를 만들어 넣는다(본문 데이터 표 이전). cell_texts_json = 셀
+    /// 텍스트 JSON 배열(row-major). 반환: `{"ok":true}`
+    #[allow(clippy::too_many_arguments)]
+    #[wasm_bindgen(js_name = createTableInCell)]
+    pub fn create_table_in_cell(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+        cell_idx: u32,
+        cell_para_idx: u32,
+        rows: u32,
+        cols: u32,
+        cell_texts_json: &str,
+    ) -> Result<String, JsValue> {
+        let cell_texts: Vec<String> = serde_json::from_str(cell_texts_json)
+            .map_err(|e| JsValue::from_str(&format!("cell_texts JSON 파싱 실패: {}", e)))?;
+        self.create_table_in_cell_native(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
+            rows as u16,
+            cols as u16,
+            cell_texts,
+        )
+        .map_err(|e| e.into())
+    }
+
     /// 커서 위치에 새 표를 삽입한다.
     ///
     /// 반환: JSON `{"ok":true,"paraIdx":<N>,"controlIdx":0}`
@@ -2187,6 +2264,44 @@ impl HwpDocument {
             section_idx as usize,
             para_idx as usize,
             char_offset as usize,
+            image_data,
+            width,
+            height,
+            natural_width_px,
+            natural_height_px,
+            extension,
+            description,
+        )
+        .map_err(|e| e.into())
+    }
+
+    /// 표 셀 안에 그림을 넣는다(insertPicture의 셀 버전). 그림 문단을 셀의
+    /// paragraphs[cell_para_idx] 위치에 삽입한다.
+    ///
+    /// 반환: JSON `{"ok":true}`
+    #[wasm_bindgen(js_name = insertPictureInCell)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_picture_in_cell(
+        &mut self,
+        section_idx: u32,
+        parent_para_idx: u32,
+        control_idx: u32,
+        cell_idx: u32,
+        cell_para_idx: u32,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+    ) -> Result<String, JsValue> {
+        self.insert_picture_in_cell_native(
+            section_idx as usize,
+            parent_para_idx as usize,
+            control_idx as usize,
+            cell_idx as usize,
+            cell_para_idx as usize,
             image_data,
             width,
             height,

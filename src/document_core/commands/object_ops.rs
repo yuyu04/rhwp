@@ -14,6 +14,65 @@ use crate::model::shape::{common_obj_offsets, ShapeObject};
 /// table_ops의 MIN_CELL_SIZE와 동일한 기준을 사용한다.
 const MIN_SHAPE_SIZE: u32 = 200;
 
+/// 인코딩된 이미지(PNG/JPEG/GIF/BMP)의 실제 픽셀 크기를 헤더에서 읽는다.
+/// crop(원본 소스 사각형)을 실제 해상도와 일치시키는 데 쓰인다 — 표시 크기(extent)를
+/// crop으로 쓰면 고해상도 이미지가 렌더 시 1:1로 그려져 박스를 넘친다.
+/// (renderer/svg.rs::parse_image_dimensions 와 동일 로직, document_core 계층 자족용.)
+fn decode_image_px(data: &[u8]) -> Option<(u32, u32)> {
+    if data.len() < 24 {
+        return None;
+    }
+    // PNG: IHDR (바이트 16-23)
+    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+        let h = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    // JPEG: SOF 마커
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        let mut i = 2;
+        while i + 9 < data.len() {
+            if data[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = data[i + 1];
+            if (0xC0..=0xCF).contains(&marker)
+                && marker != 0xC4
+                && marker != 0xC8
+                && marker != 0xCC
+            {
+                let h = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
+                let w = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
+                if w > 0 && h > 0 {
+                    return Some((w, h));
+                }
+            }
+            let seg_len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+            i += 2 + seg_len;
+        }
+    }
+    // GIF: 바이트 6-9
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        let w = u16::from_le_bytes([data[6], data[7]]) as u32;
+        let h = u16::from_le_bytes([data[8], data[9]]) as u32;
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    // BMP: 바이트 18-25
+    if data.starts_with(&[0x42, 0x4D]) && data.len() >= 26 {
+        let w = u32::from_le_bytes([data[18], data[19], data[20], data[21]]);
+        let h = i32::from_le_bytes([data[22], data[23], data[24], data[25]]).unsigned_abs();
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    None
+}
+
 impl DocumentCore {
     pub fn get_picture_properties_native(
         &self,
@@ -1466,9 +1525,14 @@ impl DocumentCore {
             ..Default::default()
         };
 
+        // crop(원본 소스 사각형)은 이미지의 실제 픽셀 해상도와 일치해야 렌더러가
+        // 박스 크기로 축소 표시한다. extent(표시) px 를 쓰면 고해상도 이미지가 1:1 로
+        // 그려져 넘친다. 실제 px 를 디코드해 crop/original = 실제px×75 로 맞춘다.
+        let (src_w_px, src_h_px) =
+            decode_image_px(image_data).unwrap_or((natural_width_px, natural_height_px));
         let shape_attr = ShapeComponentAttr {
-            original_width: width,
-            original_height: height,
+            original_width: src_w_px * 75,
+            original_height: src_h_px * 75,
             current_width: width,
             current_height: height,
             local_file_version: 1,
@@ -1477,18 +1541,20 @@ impl DocumentCore {
             ..Default::default()
         };
 
-        // border_x/border_y: 4 꼭짓점 좌표 (x,y 쌍으로 연속 저장)
-        // [tl.x, tl.y, tr.x, tr.y], [br.x, br.y, bl.x, bl.y]
-        let bx = [0i32, 0, width as i32, 0];
-        let by = [width as i32, height as i32, 0, height as i32];
+        // border_x/border_y: 그림 4모서리(원본 크기 기준). 한컴 정품은 '원본(자연)' 크기를
+        // 넣는다(common/current는 표시 크기로 별개). 박스(width/height)를 넣으면 한컴이 원본보다
+        // 작은 폴리곤으로 보고 그림을 축소(1/4 등)해 그린다 — 반드시 원본(src_px×75)을 쓴다.
+        let orig_w = (src_w_px * 75) as i32;
+        let orig_h = (src_h_px * 75) as i32;
+        let bx = [0i32, 0, orig_w, 0];
+        let by = [orig_w, orig_h, 0, orig_h];
 
-        // crop: 비크롭 시 이미지 원본 범위 (원본 크기 = 디스플레이 크기일 때)
-        // crop: 이미지 원본 픽셀 크기 × 75 (HWPUNIT/pixel at 96DPI)
+        // crop: 이미지 실제 원본 픽셀 크기 × 75 (HWPUNIT/pixel at 96DPI)
         let crop = CropInfo {
             left: 0,
             top: 0,
-            right: (natural_width_px * 75) as i32,
-            bottom: (natural_height_px * 75) as i32,
+            right: orig_w,
+            bottom: orig_h,
         };
 
         let pic = Picture {
@@ -1632,6 +1698,515 @@ impl DocumentCore {
             "\"paraIdx\":{},\"controlIdx\":0",
             insert_para_idx
         )))
+    }
+
+    /// 표 셀 안에 그림을 넣는다(insert_picture_native의 셀 버전). 그림 한 컨트롤을 담은 새
+    /// 문단을 셀의 paragraphs[cell_para_idx] 위치에 삽입한다. BinData/Picture 생성은 본문
+    /// 버전과 동일하고, 삽입 대상만 섹션 문단 → 셀 문단으로 바뀐다.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_picture_in_cell_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+    ) -> Result<String, HwpError> {
+        use crate::model::bin_data::{
+            BinData, BinDataCompression, BinDataContent, BinDataStatus, BinDataType,
+        };
+        use crate::model::image::{CropInfo, ImageAttr, ImageEffect, Picture};
+        use crate::model::paragraph::{CharShapeRef, LineSeg, Paragraph};
+        use crate::model::shape::{CommonObjAttr, HorzRelTo, ShapeComponentAttr, VertRelTo};
+
+        if image_data.is_empty() {
+            return Err(HwpError::RenderError("이미지 데이터가 비어 있습니다".to_string()));
+        }
+        // 실제 이미지 픽셀 크기 디코드. 표시 높이는 이 실제 비율로 폭에서 산출한다 —
+        // 렌더러가 crop(=실제 비율)로 그림을 그리므로, 전달된 height(docx extent 비율)를
+        // 그대로 두면 (1) 세로로 늘어나는 왜곡 (2) 예약 높이>실제 높이라 그림 아래 빈
+        // 간격(캡션이 멀어 보임)이 생긴다. height 를 실제 비율로 맞춰 둘 다 없앤다.
+        let (src_w_px, src_h_px) =
+            decode_image_px(image_data).unwrap_or((natural_width_px, natural_height_px));
+        let mut width = width;
+        let mut height = if src_w_px > 0 {
+            ((width as u64 * src_h_px as u64) / src_w_px as u64) as u32
+        } else {
+            height
+        };
+        // 대상 셀의 기본 문단/글자 모양 + 셀 높이를 읽는다(삽입 문단이 상속, 높이 상한용).
+        let (default_char_shape_id, default_para_shape_id, cell_h_hu) = {
+            let cell = self.get_cell_mut(section_idx, parent_para_idx, control_idx, cell_idx)?;
+            let base = cell.paragraphs.first();
+            (
+                base.and_then(|p| p.char_shapes.first().map(|c| c.char_shape_id))
+                    .unwrap_or(0),
+                base.map(|p| p.para_shape_id).unwrap_or(0),
+                cell.height,
+            )
+        };
+        // 세로로 긴 그림이 셀을 넘쳐 잘리지 않게 높이 상한을 둔다(부모 셀 높이의 60%).
+        // 폭만 98% 로 키우면 긴 그림은 폭×비율 높이가 셀을 넘는다 — 이때 비율 유지하며 축소.
+        // 30% 상한은 일반 가로 그림(높이/폭 ~0.4-0.65)까지 일괄 축소해 "그림이 작다"는
+        // 회귀를 만들었다(2026-07 연구노트 실측: 9개 중 5개 클램프). 60%면 통상 그림은
+        // 원 비율 그대로 셀 폭을 채우고, 세로로 극단적으로 긴 그림만 축소된다.
+        let max_h = (cell_h_hu * 60 / 100).max(7500);
+        if height > max_h && src_h_px > 0 {
+            width = ((max_h as u64 * src_w_px as u64) / src_h_px as u64) as u32;
+            height = max_h;
+        }
+
+        // --- BinData (본문 버전과 동일) ---
+        let next_id = self.document.bin_data_content.len() as u16 + 1;
+        self.document.bin_data_content.push(BinDataContent {
+            id: next_id,
+            data: image_data.to_vec(),
+            extension: extension.to_string(),
+        });
+        self.document.doc_info.bin_data_list.push(BinData {
+            raw_data: None,
+            attr: 0x0101,
+            data_type: BinDataType::Embedding,
+            compression: BinDataCompression::Default,
+            status: BinDataStatus::Success,
+            abs_path: None,
+            rel_path: None,
+            storage_id: next_id,
+            extension: Some(extension.to_string()),
+        });
+        self.document.doc_info.raw_stream = None;
+
+        // --- Picture (본문 버전과 동일) ---
+        let common_attr: u32 = 0x01 | (2 << 3) | (2 << 8) | (4 << 15) | (2 << 18);
+        let common = CommonObjAttr {
+            ctrl_id: 0x67736F20,
+            attr: common_attr,
+            treat_as_char: true,
+            vert_rel_to: VertRelTo::Para,
+            horz_rel_to: HorzRelTo::Column,
+            width,
+            height,
+            z_order: 0,
+            description: description.to_string(),
+            ..Default::default()
+        };
+        // crop(원본 소스 사각형)은 반드시 이미지의 실제 픽셀 해상도와 일치해야 한다.
+        // 렌더러(svg.rs::compute_image_crop_src)는 crop_hu/75 를 소스 px 로 환산하여
+        // 실제 디코드 px 와 비교, 다르면 "잘림"으로 보고 이미지를 1:1 로 그린다.
+        // (src_w_px/src_h_px 는 위에서 디코드했다.)
+        let shape_attr = ShapeComponentAttr {
+            original_width: src_w_px * 75,
+            original_height: src_h_px * 75,
+            current_width: width,
+            current_height: height,
+            local_file_version: 1,
+            render_sx: 1.0,
+            render_sy: 1.0,
+            ..Default::default()
+        };
+        // border_x/border_y = 그림 4모서리(원본 크기 기준). 한컴 정품은 여기에 '원본(자연)'
+        // 크기를 넣는다(common/current는 표시 크기로 별개). 박스(width/height)를 넣으면 한컴이
+        // 원본보다 작은 폴리곤으로 보고 그림을 축소(예: 1/4)해 그린다 — hop은 common으로 그려
+        // 정상이라 안 보였다. 반드시 원본 크기(src_px×75)를 쓴다.
+        let orig_w = (src_w_px * 75) as i32;
+        let orig_h = (src_h_px * 75) as i32;
+        let bx = [0i32, 0, orig_w, 0];
+        let by = [orig_w, orig_h, 0, orig_h];
+        let crop = CropInfo {
+            left: 0,
+            top: 0,
+            right: orig_w,
+            bottom: orig_h,
+        };
+        let pic = Picture {
+            common,
+            shape_attr,
+            border_x: bx,
+            border_y: by,
+            crop,
+            image_attr: ImageAttr {
+                bin_data_id: next_id,
+                brightness: 0,
+                contrast: 0,
+                effect: ImageEffect::RealPic,
+                external_path: None,
+            },
+            ..Default::default()
+        };
+
+        // --- 그림 문단(본문 버전과 동일 형태). segment_width는 셀 기준이 없어 그림 폭 사용. ---
+        let mut pic_raw_header_extra = vec![0u8; 10];
+        pic_raw_header_extra[0..2].copy_from_slice(&1u16.to_le_bytes());
+        pic_raw_header_extra[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let pic_para = Paragraph {
+            text: String::new(),
+            char_count: 9,
+            control_mask: 0x00000800,
+            char_offsets: vec![],
+            char_shapes: vec![CharShapeRef {
+                start_pos: 0,
+                char_shape_id: default_char_shape_id,
+            }],
+            line_segs: vec![LineSeg {
+                text_start: 0,
+                line_height: height as i32,
+                text_height: height as i32,
+                baseline_distance: (height as i32 * 850) / 1000,
+                line_spacing: 600,
+                segment_width: width as i32,
+                tag: 0x00060000,
+                ..Default::default()
+            }],
+            para_shape_id: default_para_shape_id,
+            style_id: 0,
+            controls: vec![Control::Picture(Box::new(pic))],
+            ctrl_data_records: vec![None],
+            has_para_text: true,
+            raw_header_extra: pic_raw_header_extra,
+            char_count_msb: false,
+            ..Default::default()
+        };
+
+        // --- 셀 문단 목록에 삽입 ---
+        {
+            let cell = self.get_cell_mut(section_idx, parent_para_idx, control_idx, cell_idx)?;
+            let at = cell_para_idx.min(cell.paragraphs.len());
+            cell.paragraphs.insert(at, pic_para);
+            // [fork] 그림 문단 삽입으로 뒤 문단들의 셀 내 Y 오프셋이 밀리므로 셀 전체
+            // 문단의 vertical_pos 를 재누적한다(줄/그림 겹침 방지). text_editing 의
+            // reflow_cell_paragraph 와 동일한 정합.
+            crate::renderer::composer::recalculate_section_vpos(&mut cell.paragraphs, 0);
+        }
+        self.document.sections[section_idx].raw_stream = None;
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+        Ok(super::super::helpers::json_ok_with("\"ok\":true"))
+    }
+
+    /// 모든 그림의 border_x/border_y(4모서리)를 '원본 크기'로 바로잡는다.
+    ///
+    /// 한컴 정품 그림은 border에 원본(자연) 크기를 넣는데, 과거 삽입 코드가 박스(표시) 크기를
+    /// 넣어 한컴에서 그림이 1/4로 축소돼 그려졌다(hop은 common으로 그려 정상). 이미 만들어진
+    /// 파일의 그림들을 shape_attr.original_width/height 기준으로 일괄 교정한다. 셀 안 그림도
+    /// 재귀 처리. border_x/y는 직렬화가 모델에서 재생성하므로 raw 보정은 불필요.
+    pub fn fix_picture_borders_native(&mut self) -> Result<String, HwpError> {
+        fn fix(paras: &mut [crate::model::paragraph::Paragraph]) -> usize {
+            let mut n = 0;
+            for p in paras.iter_mut() {
+                for ctrl in p.controls.iter_mut() {
+                    match ctrl {
+                        Control::Picture(pic) => {
+                            let ow = pic.shape_attr.original_width as i32;
+                            let oh = pic.shape_attr.original_height as i32;
+                            if ow > 0 && oh > 0 {
+                                pic.border_x = [0, 0, ow, 0];
+                                pic.border_y = [ow, oh, 0, oh];
+                                n += 1;
+                            }
+                        }
+                        Control::Table(t) => {
+                            for cell in t.cells.iter_mut() {
+                                n += fix(&mut cell.paragraphs);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            n
+        }
+        let mut total = 0;
+        for s in self.document.sections.iter_mut() {
+            let c = fix(&mut s.paragraphs);
+            if c > 0 {
+                s.raw_stream = None;
+            }
+            total += c;
+        }
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"fixed\":{}",
+            total
+        )))
+    }
+
+    /// 표 셀 안에 작은 표(중첩 표)를 만들어 넣는다. 본문 데이터 표(docx)를 양식 본문 셀에
+    /// 옮길 때 쓴다. rows×cols 표를 부모 셀 내부 폭에 맞춰 만들고 cell_texts(row-major)로
+    /// 셀을 채운 뒤, 표를 담은 문단을 부모 셀의 cell_para_idx 위치에 삽입한다.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_table_in_cell_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        rows: u16,
+        cols: u16,
+        cell_texts: Vec<String>,
+    ) -> Result<String, HwpError> {
+        use crate::model::paragraph::{CharShapeRef, LineSeg, Paragraph};
+        use crate::model::style::{BorderFill, BorderLine, BorderLineType, DiagonalLine, Fill};
+        use crate::model::table::{Cell, Table, TablePageBreak, VerticalAlign};
+        use crate::renderer::composer::{recalculate_section_vpos, reflow_line_segs};
+        use crate::renderer::hwpunit_to_px;
+
+        if rows == 0 || cols == 0 || cols > 256 {
+            return Err(HwpError::RenderError(format!(
+                "중첩 표 행/열 범위 오류(행={}, 열={})",
+                rows, cols
+            )));
+        }
+
+        // 1) 부모 셀 내부 폭 + 기본 문단/글자 모양을 읽는다.
+        let (inner_w_hu, default_char_shape_id, default_para_shape_id) = {
+            let cell = self.get_cell_mut(section_idx, parent_para_idx, control_idx, cell_idx)?;
+            let pad = cell.padding.left as i32 + cell.padding.right as i32;
+            let inner = (cell.width as i32 - pad).max(2000) as u32;
+            let base = cell.paragraphs.first();
+            (
+                inner,
+                base.and_then(|p| p.char_shapes.first().map(|c| c.char_shape_id))
+                    .unwrap_or(0),
+                base.map(|p| p.para_shape_id).unwrap_or(0),
+            )
+        };
+
+        // 2) 실선 테두리 BorderFill 확보(없으면 생성) — 표가 보이도록.
+        let cell_border_fill_id = {
+            let existing = self.document.doc_info.border_fills.iter().position(|bf| {
+                bf.borders
+                    .iter()
+                    .all(|b| b.line_type == BorderLineType::Solid && b.width >= 1)
+            });
+            if let Some(idx) = existing {
+                (idx + 1) as u16
+            } else {
+                let solid = BorderLine {
+                    line_type: BorderLineType::Solid,
+                    width: 1,
+                    color: 0,
+                };
+                self.document.doc_info.border_fills.push(BorderFill {
+                    raw_data: None,
+                    attr: 0,
+                    borders: [solid, solid, solid, solid],
+                    diagonal: DiagonalLine {
+                        diagonal_type: 1,
+                        width: 0,
+                        color: 0,
+                    },
+                    fill: Fill::default(),
+                });
+                self.document.doc_info.raw_stream = None;
+                self.document.doc_info.border_fills.len() as u16
+            }
+        };
+
+        // 3) 치수: 부모 셀 내부 폭을 열 수로 등분. 본문 데이터 표는 좁은 본문 셀에 들어가므로
+        // 컴팩트하게: 작은 글자(9pt=900)·좁은 패딩·타이트한 줄간격으로 행 높이를 줄여
+        // 셀을 넘쳐 잘리지 않게 한다.
+        let cell_font: i32 = 900; // 9pt
+        let col_width = (inner_w_hu / cols as u32).max(1000);
+        let total_width = col_width * cols as u32;
+        let cell_pad = crate::model::Padding {
+            left: 280,
+            right: 280,
+            top: 60,
+            bottom: 60,
+        };
+        let rendered_row_height: u32 = cell_pad.top as u32 + cell_font as u32 + cell_pad.bottom as u32;
+        let total_height = rendered_row_height * rows as u32;
+        let cell_height: u32 = (cell_pad.top + cell_pad.bottom) as u32;
+        let inner_cell_w_px = hwpunit_to_px(
+            (col_width as i32 - cell_pad.left as i32 - cell_pad.right as i32).max(200),
+            self.dpi,
+        );
+
+        // 4a) 표 셀용 컴팩트 글자모양(비볼드, 9pt) 확보 — 본문 셀의 기본 글자모양이 굵거나
+        // 크면(예: 제목 강조 셀 상속) 표 글씨도 굵고 커지므로, 전용 컴팩트 글자모양을 만든다.
+        let compact_cs: u32 = {
+            let base = self
+                .document
+                .doc_info
+                .char_shapes
+                .get(default_char_shape_id as usize)
+                .cloned();
+            if let Some(mut nc) = base {
+                nc.bold = false;
+                nc.attr &= !0x02;
+                nc.base_size = cell_font;
+                nc.raw_data = None;
+                let id = self.document.doc_info.char_shapes.len() as u32;
+                self.document.doc_info.char_shapes.push(nc);
+                self.document.doc_info.raw_stream = None;
+                id
+            } else {
+                default_char_shape_id
+            }
+        };
+
+        // 4b) 셀 생성 + 텍스트 채움 + reflow + 줄간격 타이트화.
+        let mut cells = Vec::with_capacity(rows as usize * cols as usize);
+        for r in 0..rows {
+            for c in 0..cols {
+                let mut cell = Cell::new_empty(c, r, col_width, cell_height, cell_border_fill_id);
+                cell.padding = cell_pad;
+                cell.vertical_align = VerticalAlign::Center;
+                cell.raw_list_extra = Vec::new();
+                let text = cell_texts
+                    .get(r as usize * cols as usize + c as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(cp) = cell.paragraphs.first_mut() {
+                    cp.char_count_msb = true;
+                    cp.para_shape_id = default_para_shape_id;
+                    cp.char_shapes = vec![CharShapeRef {
+                        start_pos: 0,
+                        char_shape_id: compact_cs,
+                    }];
+                    let mut rhe = vec![0u8; 10];
+                    rhe[0..2].copy_from_slice(&1u16.to_le_bytes());
+                    rhe[4..6].copy_from_slice(&1u16.to_le_bytes());
+                    cp.raw_header_extra = rhe;
+                    if !text.is_empty() {
+                        cp.insert_text_at(0, &text);
+                    }
+                    reflow_line_segs(cp, inner_cell_w_px, &self.styles, self.dpi);
+                    // 줄간격 타이트화: reflow 가 본문 문단모양(예: 160%)을 따라 line_spacing 을
+                    // 크게 잡으면 셀 행이 너무 높아진다. 표 셀은 폰트 크기 기준 최소 줄높이 +
+                    // 작은 줄간격으로 강제한다.
+                    for ls in cp.line_segs.iter_mut() {
+                        ls.line_height = cell_font;
+                        ls.text_height = cell_font;
+                        ls.baseline_distance = (cell_font * 850) / 1000;
+                        ls.line_spacing = 90;
+                    }
+                }
+                cells.push(cell);
+            }
+        }
+
+        // 5) Table 구조체(한컴 기본값) — create_table_native 정합.
+        let row_sizes: Vec<i16> = (0..rows).map(|_| cols as i16).collect();
+        let flags: u32 = (2 << 3) | (3 << 8) | (4 << 15) | (2 << 18) | (1 << 21);
+        let outer_margin: i16 = 283;
+        let mut raw_ctrl_data = vec![0u8; 38];
+        raw_ctrl_data[common_obj_offsets::FLAGS].copy_from_slice(&flags.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::WIDTH].copy_from_slice(&total_width.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::HEIGHT].copy_from_slice(&total_height.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::MARGIN_LEFT].copy_from_slice(&outer_margin.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::MARGIN_RIGHT]
+            .copy_from_slice(&outer_margin.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::MARGIN_TOP].copy_from_slice(&outer_margin.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::MARGIN_BOTTOM]
+            .copy_from_slice(&outer_margin.to_le_bytes());
+        let instance_id: u32 = {
+            let mut h: u32 = 0x7c160000;
+            h = h.wrapping_add(rows as u32 * 0x1000);
+            h = h.wrapping_add(cols as u32 * 0x100);
+            h = h.wrapping_add(total_width);
+            if h == 0 {
+                h = 0x7c164b69;
+            }
+            h
+        };
+        raw_ctrl_data[common_obj_offsets::INSTANCE_ID].copy_from_slice(&instance_id.to_le_bytes());
+
+        let mut table = Table {
+            attr: 0x082A2210,
+            row_count: rows,
+            col_count: cols,
+            cell_spacing: 0,
+            padding: crate::model::Padding {
+                left: 510,
+                right: 510,
+                top: 141,
+                bottom: 141,
+            },
+            row_sizes,
+            border_fill_id: cell_border_fill_id,
+            zones: Vec::new(),
+            cells,
+            cell_grid: Vec::new(),
+            page_break: TablePageBreak::None,
+            repeat_header: false,
+            caption: None,
+            common: crate::model::shape::CommonObjAttr {
+                treat_as_char: false,
+                text_wrap: crate::model::shape::TextWrap::TopAndBottom,
+                vert_rel_to: crate::model::shape::VertRelTo::Para,
+                horz_rel_to: crate::model::shape::HorzRelTo::Para,
+                vert_align: crate::model::shape::VertAlign::Top,
+                horz_align: crate::model::shape::HorzAlign::Left,
+                width: total_width,
+                height: total_height,
+                ..Default::default()
+            },
+            outer_margin_left: 283,
+            outer_margin_right: 283,
+            outer_margin_top: 283,
+            outer_margin_bottom: 283,
+            raw_ctrl_data,
+            raw_table_record_attr: 0x00000006,
+            raw_table_record_extra: vec![0u8; 2],
+            dirty: true,
+        };
+        table.rebuild_grid();
+
+        // 6) 표를 담은 문단.
+        let mut table_raw_header_extra = vec![0u8; 10];
+        table_raw_header_extra[0..2].copy_from_slice(&1u16.to_le_bytes());
+        table_raw_header_extra[4..6].copy_from_slice(&1u16.to_le_bytes());
+        // 표 문단 line_height 를 중첩 표 전체 높이로 — 셀이 표만큼 세로 공간을 예약해야
+        // 셀 안에서 culling 되지 않고 렌더된다(이미지 문단이 그림 높이를 쓰는 것과 동일).
+        let table_line_h = (total_height as i32).max(1000);
+        let table_para = Paragraph {
+            text: String::new(),
+            char_count: 9,
+            control_mask: 0x00000800,
+            char_offsets: vec![],
+            char_shapes: vec![CharShapeRef {
+                start_pos: 0,
+                char_shape_id: default_char_shape_id,
+            }],
+            line_segs: vec![LineSeg {
+                text_start: 0,
+                line_height: table_line_h,
+                text_height: table_line_h,
+                baseline_distance: (table_line_h * 850) / 1000,
+                line_spacing: 600,
+                segment_width: 0,
+                tag: 0x00060000,
+                ..Default::default()
+            }],
+            para_shape_id: default_para_shape_id,
+            style_id: 0,
+            controls: vec![Control::Table(Box::new(table))],
+            ctrl_data_records: vec![None],
+            has_para_text: true,
+            raw_header_extra: table_raw_header_extra,
+            char_count_msb: false,
+            ..Default::default()
+        };
+
+        // 7) 부모 셀에 삽입 + vpos 재누적.
+        {
+            let cell = self.get_cell_mut(section_idx, parent_para_idx, control_idx, cell_idx)?;
+            let at = cell_para_idx.min(cell.paragraphs.len());
+            cell.paragraphs.insert(at, table_para);
+            recalculate_section_vpos(&mut cell.paragraphs, 0);
+        }
+        self.document.sections[section_idx].raw_stream = None;
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+        Ok(super::super::helpers::json_ok_with("\"ok\":true"))
     }
 
     /// 표의 모든 셀 bbox를 반환한다 (네이티브).
