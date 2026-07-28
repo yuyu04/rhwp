@@ -4007,6 +4007,344 @@ impl DocumentCore {
         Ok(true)
     }
 
+    /// 표 문단과 '쪽 나누기' 문단 사이에 낀 빈 문단을 제거한다.
+    ///
+    /// 양식 이어쓰기(표 복제)에서 표를 붙이면 표 뒤에 빈 문단이 남는다. 표가 페이지를
+    /// 거의 가득 채우면 이 빈 문단이 다음 페이지로 흘러 한컴에서 빈 페이지를 만든다
+    /// (hop 뷰어는 흡수하지만 고객은 한컴으로 보므로 문제). 다음 문단이 어차피 쪽 나누기라
+    /// 이 빈 문단은 페이지 분리에 불필요하므로 제거한다(검증: 92→50쪽, 표 50개 전부 보존).
+    /// 마지막 표(다음이 쪽나누기가 아님)는 조건에서 제외돼 문서 유효성을 유지한다.
+    /// 반환: `{"removed":N}`
+    pub fn remove_orphan_paras_before_page_breaks_native(
+        &mut self,
+        section_idx: usize,
+    ) -> Result<String, HwpError> {
+        use crate::model::control::Control;
+        use crate::model::paragraph::ColumnBreakType;
+
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+
+        let mut removed = 0usize;
+        {
+            let ps = &mut self.document.sections[section_idx].paragraphs;
+            let mut i = 0usize;
+            while i + 1 < ps.len() {
+                let is_empty = ps[i].text.trim().is_empty()
+                    && !ps[i].controls.iter().any(|c| {
+                        matches!(
+                            c,
+                            Control::Table(_) | Control::Picture(_) | Control::Shape(_)
+                        )
+                    })
+                    && !matches!(ps[i].column_type, ColumnBreakType::Page);
+                let prev_has_table = i > 0
+                    && ps[i - 1]
+                        .controls
+                        .iter()
+                        .any(|c| matches!(c, Control::Table(_)));
+                let next_is_page_break = matches!(ps[i + 1].column_type, ColumnBreakType::Page);
+                if is_empty && prev_has_table && next_is_page_break {
+                    ps.remove(i);
+                    removed += 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        if removed > 0 {
+            self.document.sections[section_idx].raw_stream = None;
+            self.mark_section_dirty(section_idx);
+            self.recompose_section(section_idx);
+            self.invalidate_page_tree_cache();
+            self.paginate();
+        }
+
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"removed\":{}",
+            removed
+        )))
+    }
+
+    /// 구역 끝, '마지막 표 뒤'에 남은 빈 문단들을 제거한다(끝 빈 페이지 방지).
+    ///
+    /// 양식 이어쓰기/일괄 변환 뒤 마지막 항목 표 뒤에 빈 문단(쪽 나눔 문단 포함)이 남으면,
+    /// 표가 페이지를 거의 꽉 채우므로 그 한 줄이 다음 페이지로 밀려 문서 끝에 빈 페이지가
+    /// 생긴다(2026-07 실측: rhwp/한컴 공통). 원본 템플릿은 표 문단으로 구역이 끝나므로
+    /// 제거해도 원형과 같다. 마지막 표 뒤에 '보이는 내용'이 있는 문단이 하나라도 있으면
+    /// 아무것도 지우지 않는다(0 반환) — 본문 훼손 금지.
+    pub fn trim_trailing_paras_after_last_table_native(
+        &mut self,
+        section_idx: usize,
+    ) -> Result<String, HwpError> {
+        use crate::model::control::Control;
+        use crate::model::paragraph::ColumnBreakType;
+
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+
+        let (last_table_idx, tail_all_empty) = {
+            let ps = &self.document.sections[section_idx].paragraphs;
+            let last_table_idx = ps
+                .iter()
+                .rposition(|p| p.controls.iter().any(|c| matches!(c, Control::Table(_))));
+            let tail_all_empty = last_table_idx.is_some_and(|t| {
+                ps[t + 1..].iter().all(|p| {
+                    p.text.trim().is_empty()
+                        && !p.controls.iter().any(|c| {
+                            matches!(
+                                c,
+                                Control::Table(_) | Control::Picture(_) | Control::Shape(_)
+                            )
+                        })
+                        && !matches!(p.column_type, ColumnBreakType::Section)
+                })
+            });
+            (last_table_idx, tail_all_empty)
+        };
+
+        let mut removed = 0usize;
+        if let (Some(t), true) = (last_table_idx, tail_all_empty) {
+            let len = self.document.sections[section_idx].paragraphs.len();
+            // 끝에서부터 지운다 — delete_paragraph_native가 조판 부기를 함께 정리한다.
+            for idx in ((t + 1)..len).rev() {
+                self.delete_paragraph_native(section_idx, idx)?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.invalidate_page_tree_cache();
+            self.paginate();
+        }
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"removed\":{}",
+            removed
+        )))
+    }
+
+    /// 항목 표 '바로 위'의 빈 선행 문단(구역/쪽 나눔 문단 포함)을 최소 높이로 압축한다.
+    ///
+    /// 양식 이어쓰기로 만든 항목 표는 페이지를 거의 꽉 채워(본문 영역 대비 여백 9~11px)
+    /// 표 위에 한 줄(~20px)이 얹히면 한컴에서 표가 다음 페이지로 밀린다(특히 구역 시작
+    /// 문단이 다른 선행 문단보다 살짝 큰 첫 항목). 이 빈 선행 문단의 글자모양을 초소형으로
+    /// 바꿔 줄 높이를 접으면, 표가 페이지 최상단 가까이서 시작해 모든 항목에 넉넉한 여백이
+    /// 생긴다. 텍스트가 보이는 문단·표·페이지 여백·구역/쪽 나눔 속성은 건드리지 않는다.
+    pub fn compact_leading_paras_before_tables_native(
+        &mut self,
+        section_idx: usize,
+    ) -> Result<String, HwpError> {
+        use crate::model::paragraph::CharShapeRef;
+
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+
+        // 대상: '컨트롤이 전혀 없는' 빈 문단이고 다음 문단에 표가 있는 경우.
+        //
+        // 컨트롤(구역정의 SectionDef·단정의·머리말/꼬리말 등)을 가진 문단은 절대 건드리지
+        // 않는다 — 특히 구역 시작 문단(column_type=Section)의 텍스트/글자모양을 바꾸면 한컴
+        // 2022가 '파일 손상'으로 거부한다(검증: 병합 없이 압축만 한 파일이 손상으로 열림 실패).
+        let targets: Vec<usize> = {
+            let ps = &self.document.sections[section_idx].paragraphs;
+            let mut v = Vec::new();
+            for i in 0..ps.len().saturating_sub(1) {
+                let self_plain_empty = ps[i].text.trim().is_empty()
+                    && ps[i].controls.is_empty()
+                    && !matches!(
+                        ps[i].column_type,
+                        crate::model::paragraph::ColumnBreakType::Section
+                    );
+                let next_has_table = ps[i + 1]
+                    .controls
+                    .iter()
+                    .any(|c| matches!(c, Control::Table(_)));
+                if self_plain_empty && next_has_table {
+                    v.push(i);
+                }
+            }
+            v
+        };
+
+        if targets.is_empty() {
+            return Ok(super::super::helpers::json_ok_with("\"compacted\":0"));
+        }
+
+        // 초소형 글자모양(2pt, 비볼드) 확보 — 빈 문단 줄 높이를 접기 위함. 글자가 없으므로
+        // 모양 크기는 보이지 않고 줄 높이만 줄인다(한컴도 글자모양 기준으로 재계산).
+        let tiny_cs: u32 = if self.document.doc_info.char_shapes.is_empty() {
+            0
+        } else {
+            let id = self.document.find_or_create_char_shape(
+                0,
+                &crate::model::style::CharShapeMods {
+                    bold: Some(false),
+                    base_size: Some(200), // 2pt
+                    ..Default::default()
+                },
+            );
+            self.document.doc_info.raw_stream = None;
+            self.rebuild_resolved_styles();
+            id
+        };
+
+        let page_def = self.document.sections[section_idx]
+            .section_def
+            .page_def
+            .clone();
+        let text_width =
+            page_def.width as i32 - page_def.margin_left as i32 - page_def.margin_right as i32;
+        let available_width = crate::renderer::hwpunit_to_px(text_width, self.dpi);
+        let is_hwp3_variant = self.document.layout_profile().hwp3_layout();
+
+        for &i in &targets {
+            // 압축 전 저장 end — 뒤 문단 vpos 를 이 문단이 줄어든 만큼 당겨 잇는 기준.
+            let stored_end = crate::renderer::composer::paragraph_flow_end(
+                &self.document.sections[section_idx].paragraphs[i],
+            );
+            {
+                let p = &mut self.document.sections[section_idx].paragraphs[i];
+                p.text.clear();
+                p.char_count = 0;
+                p.char_offsets.clear();
+                p.char_shapes = vec![CharShapeRef {
+                    start_pos: 0,
+                    char_shape_id: tiny_cs,
+                }];
+                p.has_para_text = false;
+            }
+            let para_shape_id =
+                self.document.sections[section_idx].paragraphs[i].para_shape_id as usize;
+            let para_style = self.styles.para_styles.get(para_shape_id);
+            let paragraph_box = ParagraphBox::body_for_style(available_width, para_style, self.dpi);
+            let p = &mut self.document.sections[section_idx].paragraphs[i];
+            reflow_line_segs(p, paragraph_box, &self.styles, self.dpi);
+            // reflow가 충분히 줄이지 못해도 저장 lineseg를 직접 최소화한다(2pt ≈ 200 HWPUNIT).
+            for ls in p.line_segs.iter_mut() {
+                ls.line_height = 200;
+                ls.text_height = 200;
+                ls.baseline_distance = 170;
+            }
+            crate::renderer::composer::recalculate_section_vpos(
+                &mut self.document.sections[section_idx].paragraphs,
+                i,
+                None,
+                stored_end,
+                &self.styles,
+                self.dpi,
+                is_hwp3_variant,
+            );
+        }
+
+        self.document.sections[section_idx].raw_stream = None;
+        self.mark_section_dirty(section_idx);
+        self.recompose_section(section_idx);
+        self.invalidate_page_tree_cache();
+        self.paginate();
+
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"compacted\":{}",
+            targets.len()
+        )))
+    }
+
+    /// 구역(section)을 바로 앞 구역에 합친다(구역 경계 제거).
+    ///
+    /// 양식 변환 결과는 표지·목차(구역0)와 항목(구역1)이 별도 구역인데, 한컴은 그 구역
+    /// 경계에 빈 페이지를 끼우는 경우가 있다(첫 항목이 한 페이지 밀림). 두 구역의 용지
+    /// 설정이 같으면 뒤 구역을 앞 구역에 붙이고 그 시작 문단을 '쪽 나눔'으로 강등해 경계를
+    /// 없앤다 → 첫 항목도 다른 항목과 똑같은 쪽 나눔 항목이 되어 밀림이 사라진다. 뒤 구역의
+    /// 구역정의·단정의·머리말/꼬리말 컨트롤은 제거한다(앞 구역 설정을 따른다). 직렬화는
+    /// control_mask를 controls에서 재계산하므로 마스크 보정은 필요 없다.
+    pub fn merge_section_into_previous_native(
+        &mut self,
+        section_idx: usize,
+    ) -> Result<String, HwpError> {
+        use crate::model::control::Control;
+        use crate::model::paragraph::ColumnBreakType;
+
+        if section_idx == 0 || section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 {} 는 앞 구역에 병합할 수 없습니다",
+                section_idx
+            )));
+        }
+        // 용지 설정 호환 검사(다르면 병합 시 레이아웃이 깨지므로 거부).
+        {
+            let prev = &self.document.sections[section_idx - 1].section_def.page_def;
+            let cur = &self.document.sections[section_idx].section_def.page_def;
+            if prev.width != cur.width
+                || prev.height != cur.height
+                || prev.margin_left != cur.margin_left
+                || prev.margin_right != cur.margin_right
+                || prev.margin_top != cur.margin_top
+                || prev.margin_bottom != cur.margin_bottom
+            {
+                return Err(HwpError::RenderError(
+                    "구역 용지 설정이 달라 병합할 수 없습니다".to_string(),
+                ));
+            }
+        }
+
+        let mut moved = std::mem::take(&mut self.document.sections[section_idx].paragraphs);
+        if let Some(first) = moved.first_mut() {
+            // 구역 시작 → 쪽 나눔으로 강등.
+            first.column_type = ColumnBreakType::Page;
+            first.raw_break_type = 0;
+            // 구역/단 정의·머리말/꼬리말 컨트롤 제거(+정렬된 ctrl_data_records도 함께).
+            let keep: Vec<usize> = first
+                .controls
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    !matches!(
+                        c,
+                        Control::SectionDef(_)
+                            | Control::ColumnDef(_)
+                            | Control::Header(_)
+                            | Control::Footer(_)
+                    )
+                })
+                .map(|(i, _)| i)
+                .collect();
+            if keep.len() != first.controls.len() {
+                let new_controls: Vec<Control> =
+                    keep.iter().map(|&i| first.controls[i].clone()).collect();
+                let new_cd: Vec<Option<Vec<u8>>> = keep
+                    .iter()
+                    .map(|&i| first.ctrl_data_records.get(i).cloned().flatten())
+                    .collect();
+                first.controls = new_controls;
+                first.ctrl_data_records = new_cd;
+            }
+        }
+
+        let prev_idx = section_idx - 1;
+        self.document.sections[prev_idx]
+            .paragraphs
+            .append(&mut moved);
+        self.document.sections[prev_idx].raw_stream = None;
+        self.document.sections.remove(section_idx);
+
+        // 구역 수가 바뀌어 구역 색인 파생 상태(composed·측정·dirty·단 배치)가 모두 어긋난다.
+        // 문서 교체와 같은 경로로 원본에서 전부 다시 만든다.
+        self.mark_section_dirty(prev_idx);
+        self.rebuild_derived_state();
+
+        Ok(super::super::helpers::json_ok_with("\"merged\":true"))
+    }
+
     /// 단 나누기 삽입 (Ctrl+Shift+Enter).
     /// 시작 위치에서도 문단을 분리하고 새 문단에 단 나눔을 설정한다.
     /// 1단 문서에서는 쪽 나누기와 동일하게 동작한다.
@@ -7297,6 +7635,369 @@ mod tests {
             page_count >= 2,
             "페이지 수: {} (2 이상이어야 함)",
             page_count
+        );
+    }
+
+    /// [hop fork] 표 문단 (sec0) 의 (para, ctrl) 를 찾는다.
+    fn hop_find_table(core: &DocumentCore) -> (usize, usize) {
+        for (pi, p) in core.document.sections[0].paragraphs.iter().enumerate() {
+            for (ci, c) in p.controls.iter().enumerate() {
+                if matches!(c, Control::Table(_)) {
+                    return (pi, ci);
+                }
+            }
+        }
+        panic!("표 없음");
+    }
+
+    fn hop_cell_paras(core: &DocumentCore, pi: usize, ci: usize, cell: usize) -> Vec<Paragraph> {
+        match &core.document.sections[0].paragraphs[pi].controls[ci] {
+            Control::Table(t) => t.cells[cell].paragraphs.clone(),
+            _ => panic!("표 아님"),
+        }
+    }
+
+    /// [hop fork] 포크가 v0.7.13 에서 `reflow_cell_paragraph` 에 넣었던 셀 vpos 재누적
+    /// (줄 뭉침 Phase A) 은 v0.8.7 에서 뺐다 — upstream 셀 편집 경로가
+    /// `recalculate_cell_paragraph_vpos_native` 로 같은 일을 한다. 양식 채우기와 같은
+    /// insertTextInCell/splitParagraphInCell 순서로 다문단 셀을 만들고, 셀 문단 첫 줄 vpos 가
+    /// 단조 증가(겹치지 않음)함을 계측으로 확인한다.
+    #[test]
+    fn hop_fill_path_multi_paragraph_cell_vpos_is_cumulative() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        core.create_table_native(0, 0, 0, 2, 2).unwrap();
+        let (pi, ci) = hop_find_table(&core);
+        let lines = [
+            "첫째 줄 본문",
+            "둘째 줄 본문",
+            "셋째 줄 본문",
+            "넷째 줄 본문",
+        ];
+        for (k, text) in lines.iter().enumerate() {
+            if k > 0 {
+                let len = core
+                    .get_cell_paragraph_length_native(0, pi, ci, 0, k - 1)
+                    .unwrap();
+                core.split_paragraph_in_cell_native(0, pi, ci, 0, k - 1, len, None)
+                    .unwrap();
+            }
+            core.insert_text_in_cell_native(0, pi, ci, 0, k, 0, text)
+                .unwrap();
+        }
+        let paras = hop_cell_paras(&core, pi, ci, 0);
+        assert_eq!(paras.len(), lines.len());
+        let firsts: Vec<i32> = paras
+            .iter()
+            .map(|p| p.line_segs.first().map(|ls| ls.vertical_pos).unwrap_or(-1))
+            .collect();
+        assert!(
+            firsts.windows(2).all(|w| w[1] > w[0]),
+            "셀 문단 vpos 가 누적돼야 함(줄 뭉침 금지): {:?}",
+            firsts
+        );
+    }
+
+    /// [hop fork] 셀 안 중첩 표: 삽입·셀 텍스트·vpos 사다리·HWP 저장 왕복·렌더를 확인한다.
+    #[test]
+    fn hop_create_table_in_cell_round_trips() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        core.create_table_native(0, 0, 0, 2, 2).unwrap();
+        let (pi, ci) = hop_find_table(&core);
+        core.insert_text_in_cell_native(0, pi, ci, 0, 0, 0, "표 앞 본문")
+            .unwrap();
+        let texts: Vec<String> = ["규칙", "CVSS", "R-1", "7.5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let r = core
+            .create_table_in_cell_native(0, pi, ci, 0, 1, 2, 2, texts)
+            .unwrap();
+        assert!(r.contains("\"ok\":true"), "{}", r);
+
+        let paras = hop_cell_paras(&core, pi, ci, 0);
+        assert_eq!(paras.len(), 2, "본문 문단 + 표 문단");
+        let nested = paras[1]
+            .controls
+            .iter()
+            .find_map(|c| match c {
+                Control::Table(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("중첩 표");
+        assert_eq!((nested.row_count, nested.col_count), (2, 2));
+        assert_eq!(nested.cells[1].paragraphs[0].text, "CVSS");
+        assert!(!nested.common.treat_as_char);
+        assert!(
+            paras[1].line_segs[0].vertical_pos > paras[0].line_segs[0].vertical_pos,
+            "표 문단은 앞 문단 아래에서 시작"
+        );
+        assert!(core.render_page_svg_native(0).is_ok());
+
+        let bytes = core.export_hwp_native().expect("저장");
+        let reloaded = DocumentCore::from_bytes(&bytes).expect("재로드");
+        let (rpi, rci) = hop_find_table(&reloaded);
+        let rparas = hop_cell_paras(&reloaded, rpi, rci, 0);
+        let rnested = rparas
+            .iter()
+            .flat_map(|p| p.controls.iter())
+            .find_map(|c| match c {
+                Control::Table(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("재로드 후 중첩 표 유지");
+        assert_eq!((rnested.row_count, rnested.col_count), (2, 2));
+        assert_eq!(rnested.cells[3].paragraphs[0].text, "7.5");
+    }
+
+    /// [hop fork] 셀 그림: 디코드 px 기준 crop/original/border/img_dim 이 저장 왕복 후 유지된다.
+    #[test]
+    fn hop_insert_picture_in_cell_round_trips_with_source_geometry() {
+        let mut png = vec![0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&400u32.to_be_bytes());
+        png.extend_from_slice(&200u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        core.create_table_native(0, 0, 0, 1, 1).unwrap();
+        let (pi, ci) = hop_find_table(&core);
+        // 표시 크기 요청은 docx extent(작은 px)여도 crop 은 실제 400×200 px 기준이어야 한다.
+        core.insert_picture_in_cell_native(0, pi, ci, 0, 1, &png, 15000, 9999, 100, 50, "png", "")
+            .unwrap();
+        let check = |core: &DocumentCore| {
+            let (pi, ci) = hop_find_table(core);
+            let pic = hop_cell_paras(core, pi, ci, 0)
+                .iter()
+                .flat_map(|p| p.controls.clone())
+                .find_map(|c| match c {
+                    Control::Picture(p) => Some(p),
+                    _ => None,
+                })
+                .expect("셀 그림");
+            assert_eq!(pic.common.width, 15000);
+            assert_eq!(pic.common.height, 7500, "높이는 실제 비율(0.5)");
+            assert_eq!((pic.crop.right, pic.crop.bottom), (30000, 15000));
+            assert_eq!(pic.shape_attr.original_width, 30000);
+            assert_eq!(pic.border_x, [0, 0, 30000, 0]);
+            assert!(pic.common.treat_as_char);
+        };
+        check(&core);
+        assert!(core.render_page_svg_native(0).is_ok());
+        let bytes = core.export_hwp_native().expect("저장");
+        let reloaded = DocumentCore::from_bytes(&bytes).expect("재로드");
+        check(&reloaded);
+    }
+
+    /// [hop fork] 표 ↔ 쪽 나누기 사이 빈 문단만 지운다.
+    #[test]
+    fn hop_remove_orphan_paras_before_page_breaks() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        core.create_table_native(0, 0, 0, 1, 1).unwrap();
+        let (pi, _) = hop_find_table(&core);
+        // 표 문단 뒤: [빈 문단(create_table 이 남김)] + [쪽 나누기 빈 문단]
+        let n = core.document.sections[0].paragraphs.len();
+        assert!(n > pi + 1, "표 뒤 빈 문단 존재");
+        core.split_paragraph_native(0, n - 1, 0, None).unwrap();
+        let last = core.document.sections[0].paragraphs.len() - 1;
+        core.document.sections[0].paragraphs[last].column_type = ColumnBreakType::Page;
+        let before = core.document.sections[0].paragraphs.len();
+        let r = core
+            .remove_orphan_paras_before_page_breaks_native(0)
+            .unwrap();
+        assert!(r.contains("\"removed\":1"), "{}", r);
+        assert_eq!(core.document.sections[0].paragraphs.len(), before - 1);
+        assert!(matches!(
+            core.document.sections[0].paragraphs[pi + 1].column_type,
+            ColumnBreakType::Page
+        ));
+    }
+
+    /// [hop fork] 목차 첫 열을 항목 표(6×3) 시작 쪽번호로 다시 매긴다.
+    #[test]
+    fn hop_sync_toc_page_numbers_writes_entry_start_pages() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        // 목차 표(머리글 + 2행).
+        core.create_table_native(0, 0, 0, 3, 2).unwrap();
+        let (toc_p, toc_c) = hop_find_table(&core);
+        // 항목 표 2개(6×3)를 문서 끝에 붙인다.
+        for _ in 0..2 {
+            let last = core.document.sections[0].paragraphs.len() - 1;
+            core.create_table_native(0, last, 0, 6, 3).unwrap();
+        }
+        let r = core.sync_toc_page_numbers_native(0, toc_p, toc_c).unwrap();
+        assert!(r.contains("\"synced\":2"), "{}", r);
+        let cells = hop_cell_paras(&core, toc_p, toc_c, 2); // 행1 열0
+        assert!(
+            cells[0].text.chars().all(|c| c.is_ascii_digit()) && !cells[0].text.is_empty(),
+            "쪽번호 숫자: {:?}",
+            cells[0].text
+        );
+    }
+
+    /// [hop fork] 그림 border 를 원본 크기로 교정한다(셀 안 그림 포함).
+    #[test]
+    fn hop_fix_picture_borders_uses_original_size() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        core.create_table_native(0, 0, 0, 1, 1).unwrap();
+        let (pi, ci) = hop_find_table(&core);
+        let mut png = vec![0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&40u32.to_be_bytes());
+        png.extend_from_slice(&20u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        core.insert_picture_in_cell_native(0, pi, ci, 0, 0, &png, 3000, 1500, 40, 20, "png", "")
+            .unwrap();
+        if let Control::Table(t) = &mut core.document.sections[0].paragraphs[pi].controls[ci] {
+            for p in t.cells[0].paragraphs.iter_mut() {
+                for c in p.controls.iter_mut() {
+                    if let Control::Picture(pic) = c {
+                        // 과거 삽입 코드처럼 박스(표시) 크기로 망가뜨린다.
+                        pic.border_x = [0, 0, 999, 0];
+                        pic.border_y = [999, 499, 0, 499];
+                    }
+                }
+            }
+        }
+        let r = core.fix_picture_borders_native().unwrap();
+        assert!(r.contains("\"fixed\":1"), "{}", r);
+        let pic = hop_cell_paras(&core, pi, ci, 0)
+            .iter()
+            .flat_map(|p| p.controls.clone())
+            .find_map(|c| match c {
+                Control::Picture(p) => Some(p),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(pic.border_x, [0, 0, 3000, 0]);
+        assert_eq!(pic.border_y, [3000, 1500, 0, 1500]);
+        assert_eq!(pic.shape_attr.original_width, 3000);
+    }
+
+    #[test]
+    fn compact_leading_paras_shrinks_empty_para_before_table() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        // 구성: [구역 시작 문단][일반 빈 문단][표 문단]. 구역 문단(p0)은 압축 대상에서
+        // 제외되므로(컨트롤 보유), 표 앞에 '일반' 빈 문단(p1)을 따로 둔다.
+        core.split_paragraph_native(0, 0, 0, None).unwrap(); // p0 구역, p1 일반 빈
+        core.split_paragraph_native(0, 1, 0, None).unwrap(); // p1 일반 빈, p2 일반 빈
+        core.create_table_native(0, 2, 0, 2, 2).unwrap(); // p2에 표
+
+        // 표를 가진 문단 t와 그 앞 문단 t-1을 찾는다.
+        let t = core.document.sections[0]
+            .paragraphs
+            .iter()
+            .position(|p| p.controls.iter().any(|c| matches!(c, Control::Table(_))))
+            .expect("표 문단 존재");
+        assert!(t >= 1, "표 앞에 선행 문단이 있어야 함");
+
+        let before_lh = core.document.sections[0].paragraphs[t - 1]
+            .line_segs
+            .iter()
+            .map(|ls| ls.line_height)
+            .max()
+            .unwrap_or(0);
+        assert!(
+            before_lh > 300,
+            "압축 전 선행 문단 줄 높이가 큼: {}",
+            before_lh
+        );
+
+        let r = core.compact_leading_paras_before_tables_native(0).unwrap();
+        assert!(r.contains("\"compacted\":"), "결과 JSON: {}", r);
+        assert!(!r.contains("\"compacted\":0"), "최소 1개는 압축: {}", r);
+
+        // 표 앞 문단(인덱스 변동 없음 — 삭제가 아니라 압축)의 줄 높이가 최소화됐다.
+        let after_lh = core.document.sections[0].paragraphs[t - 1]
+            .line_segs
+            .iter()
+            .map(|ls| ls.line_height)
+            .max()
+            .unwrap_or(99999);
+        assert!(after_lh <= 300, "압축 후 줄 높이가 작아야 함: {}", after_lh);
+        // 표 문단은 그대로 보존된다.
+        assert!(
+            core.document.sections[0].paragraphs[t]
+                .controls
+                .iter()
+                .any(|c| matches!(c, Control::Table(_))),
+            "표는 보존되어야 함"
+        );
+    }
+
+    #[test]
+    fn rechunk_toc_splits_table_into_pages() {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        // 6행 2열 표 생성(머리글 1 + 데이터 5).
+        core.create_table_native(0, 0, 0, 6, 2).unwrap();
+        let (pi, ci) = {
+            let mut found = None;
+            for (pi, p) in core.document.sections[0].paragraphs.iter().enumerate() {
+                for (ci, c) in p.controls.iter().enumerate() {
+                    if matches!(c, Control::Table(_)) {
+                        found = Some((pi, ci));
+                    }
+                }
+            }
+            found.expect("표 생성됨")
+        };
+
+        // 데이터 5행을 2행씩 → 3청크(2,2,1).
+        let r = core.rechunk_toc_table_native(0, pi, ci, 2).unwrap();
+        assert!(r.contains("\"chunks\":3"), "결과: {}", r);
+
+        // 표 문단이 3개로 늘고, 각 표가 머리글(행0)+청크 행을 가지며 총 데이터 행이 보존된다.
+        let row_counts: Vec<u16> = core.document.sections[0]
+            .paragraphs
+            .iter()
+            .filter_map(|p| {
+                p.controls.iter().find_map(|c| match c {
+                    Control::Table(t) => Some(t.row_count),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(row_counts.len(), 3, "표 3개");
+        // 각 표 = 머리글 1 + 청크. 합계 데이터 = (rc-1) 합 = 5.
+        let total_data: u16 = row_counts.iter().map(|rc| rc - 1).sum();
+        assert_eq!(total_data, 5, "데이터 행 보존: {:?}", row_counts);
+    }
+
+    #[test]
+    fn merge_section_combines_into_previous() {
+        use crate::model::paragraph::ColumnBreakType;
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        // 둘째 구역 구성: 첫 구역 복제 + 시작 문단을 구역 나눔으로.
+        let mut sec1 = core.document.sections[0].clone();
+        sec1.paragraphs[0].column_type = ColumnBreakType::Section;
+        core.document.sections.push(sec1);
+        assert_eq!(core.document.sections.len(), 2);
+        let p0_before = core.document.sections[0].paragraphs.len();
+        let p1_before = core.document.sections[1].paragraphs.len();
+
+        let r = core.merge_section_into_previous_native(1).unwrap();
+        assert!(r.contains("\"merged\":true"), "결과: {}", r);
+        assert_eq!(core.document.sections.len(), 1, "한 구역으로 병합");
+        assert_eq!(
+            core.document.sections[0].paragraphs.len(),
+            p0_before + p1_before,
+            "모든 문단 보존"
+        );
+        // 병합 경계 문단은 구역 나눔 → 쪽 나눔으로 강등.
+        assert_eq!(
+            core.document.sections[0].paragraphs[p0_before].column_type,
+            ColumnBreakType::Page,
+            "병합된 구역 시작은 쪽 나눔"
         );
     }
 

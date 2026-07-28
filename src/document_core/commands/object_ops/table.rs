@@ -1640,6 +1640,305 @@ impl DocumentCore {
     }
 }
 
+/// [hop fork] 양식 문서 후처리용 셀 내부 표 연산.
+impl DocumentCore {
+    /// 표 셀 안에 작은 표(중첩 표)를 만들어 넣는다. 본문 데이터 표(docx)를 양식 본문 셀에
+    /// 옮길 때 쓴다. rows×cols 표를 부모 셀 내부 폭에 맞춰 만들고 cell_texts(row-major)로
+    /// 셀을 채운 뒤, 표를 담은 문단을 부모 셀의 cell_para_idx 위치에 삽입한다.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_table_in_cell_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        rows: u16,
+        cols: u16,
+        cell_texts: Vec<String>,
+    ) -> Result<String, HwpError> {
+        use crate::model::paragraph::{CharShapeRef, LineSeg};
+        use crate::model::style::{
+            BorderFill, BorderLine, BorderLineType, CenterLine, DiagonalLine, Fill,
+        };
+        use crate::model::table::{Cell, Table, TablePageBreak, VerticalAlign};
+        use crate::renderer::composer::{reflow_line_segs, ParagraphBox};
+        use crate::renderer::hwpunit_to_px;
+
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과 (총 {}개)",
+                section_idx,
+                self.document.sections.len()
+            )));
+        }
+        if rows == 0 || cols == 0 || cols > 256 {
+            return Err(HwpError::RenderError(format!(
+                "중첩 표 행/열 범위 오류(행={}, 열={})",
+                rows, cols
+            )));
+        }
+
+        // 1) 부모 셀 내부 폭 + 기본 문단/글자 모양을 읽는다.
+        let (inner_w_hu, default_char_shape_id, default_para_shape_id) = {
+            let cell = self.get_cell_mut(section_idx, parent_para_idx, control_idx, cell_idx)?;
+            let pad = cell.padding.left as i32 + cell.padding.right as i32;
+            let inner = (cell.width as i32 - pad).max(2000) as u32;
+            let base = cell.paragraphs.first();
+            (
+                inner,
+                base.and_then(|p| p.char_shapes.first().map(|c| c.char_shape_id))
+                    .unwrap_or(0),
+                base.map(|p| p.para_shape_id).unwrap_or(0),
+            )
+        };
+
+        let instance_id = super::super::clone_identity::next_instance_id(&self.document)?;
+
+        // 2) 실선 테두리 BorderFill 확보(없으면 생성) — 표가 보이도록. create_table_native 정합.
+        let cell_border_fill_id = {
+            let existing = self.document.doc_info.border_fills.iter().position(|bf| {
+                bf.borders
+                    .iter()
+                    .all(|b| b.line_type == BorderLineType::Solid && b.width >= 1)
+            });
+            if let Some(idx) = existing {
+                (idx + 1) as u16
+            } else {
+                let solid = BorderLine {
+                    line_type: BorderLineType::Solid,
+                    width: 1,
+                    color: 0,
+                };
+                self.document.doc_info.border_fills.push(BorderFill {
+                    raw_data: None,
+                    attr: 0,
+                    borders: [solid, solid, solid, solid],
+                    diagonal: DiagonalLine {
+                        diagonal_type: 1,
+                        width: 0,
+                        color: 0,
+                    },
+                    center_line: CenterLine::None,
+                    fill: Fill::default(),
+                    three_d: false,
+                });
+                self.document.doc_info.raw_stream = None;
+                self.document.doc_info.border_fills.len() as u16
+            }
+        };
+
+        // 3) 치수: 부모 셀 내부 폭을 열 수로 등분. 본문 데이터 표는 좁은 본문 셀에 들어가므로
+        // 컴팩트하게: 작은 글자(9pt=900)·좁은 패딩·타이트한 줄간격으로 행 높이를 줄여
+        // 셀을 넘쳐 잘리지 않게 한다.
+        let cell_font: i32 = 900; // 9pt
+        let col_width = (inner_w_hu / cols as u32).max(1000);
+        let total_width = col_width * cols as u32;
+        let cell_pad = crate::model::Padding {
+            left: 280,
+            right: 280,
+            top: 60,
+            bottom: 60,
+        };
+        let rendered_row_height: u32 =
+            cell_pad.top as u32 + cell_font as u32 + cell_pad.bottom as u32;
+        let total_height = rendered_row_height * rows as u32;
+        let cell_height: u32 = (cell_pad.top + cell_pad.bottom) as u32;
+        let inner_cell_w_px = hwpunit_to_px(
+            (col_width as i32 - cell_pad.left as i32 - cell_pad.right as i32).max(200),
+            self.dpi,
+        );
+
+        // 4a) 표 셀용 컴팩트 글자모양(비볼드, 9pt) 확보 — 본문 셀의 기본 글자모양이 굵거나
+        // 크면(예: 제목 강조 셀 상속) 표 글씨도 굵고 커지므로, 전용 컴팩트 글자모양을 쓴다.
+        let compact_cs: u32 = if self
+            .document
+            .doc_info
+            .char_shapes
+            .get(default_char_shape_id as usize)
+            .is_some()
+        {
+            let id = self.document.find_or_create_char_shape(
+                default_char_shape_id,
+                &crate::model::style::CharShapeMods {
+                    bold: Some(false),
+                    base_size: Some(cell_font),
+                    ..Default::default()
+                },
+            );
+            self.document.doc_info.raw_stream = None;
+            self.rebuild_resolved_styles();
+            id
+        } else {
+            default_char_shape_id
+        };
+
+        // 4b) 셀 생성 + 텍스트 채움 + reflow + 줄간격 타이트화.
+        let mut cells = Vec::with_capacity(rows as usize * cols as usize);
+        for r in 0..rows {
+            for c in 0..cols {
+                let mut cell = Cell::new_empty(c, r, col_width, cell_height, cell_border_fill_id);
+                cell.padding = cell_pad;
+                cell.vertical_align = VerticalAlign::Center;
+                cell.raw_list_extra = Vec::new();
+                let text = cell_texts
+                    .get(r as usize * cols as usize + c as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(cp) = cell.paragraphs.first_mut() {
+                    cp.char_count_msb = true;
+                    cp.para_shape_id = default_para_shape_id;
+                    cp.char_shapes = vec![CharShapeRef {
+                        start_pos: 0,
+                        char_shape_id: compact_cs,
+                    }];
+                    let mut rhe = vec![0u8; 10];
+                    rhe[0..2].copy_from_slice(&1u16.to_le_bytes());
+                    rhe[4..6].copy_from_slice(&1u16.to_le_bytes());
+                    cp.raw_header_extra = rhe;
+                    if !text.is_empty() {
+                        cp.insert_text_at(0, &text);
+                    }
+                    reflow_line_segs(
+                        cp,
+                        ParagraphBox::content_width_px(inner_cell_w_px, self.dpi),
+                        &self.styles,
+                        self.dpi,
+                    );
+                    // 줄간격 타이트화: reflow 가 본문 문단모양(예: 160%)을 따라 line_spacing 을
+                    // 크게 잡으면 셀 행이 너무 높아진다. 표 셀은 폰트 크기 기준 최소 줄높이 +
+                    // 작은 줄간격으로 강제한다.
+                    for ls in cp.line_segs.iter_mut() {
+                        ls.line_height = cell_font;
+                        ls.text_height = cell_font;
+                        ls.baseline_distance = (cell_font * 850) / 1000;
+                        ls.line_spacing = 90;
+                    }
+                }
+                cells.push(cell);
+            }
+        }
+
+        // 5) Table 구조체(한컴 기본값) — create_table_native 정합.
+        let row_sizes: Vec<i16> = (0..rows).map(|_| cols as i16).collect();
+        let flags: u32 = (2 << 3) | (3 << 8) | (4 << 15) | (2 << 18) | (1 << 21);
+        let outer_margin: i16 = 283;
+        let mut raw_ctrl_data = vec![0u8; 38];
+        raw_ctrl_data[common_obj_offsets::FLAGS].copy_from_slice(&flags.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::WIDTH].copy_from_slice(&total_width.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::HEIGHT].copy_from_slice(&total_height.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::MARGIN_LEFT].copy_from_slice(&outer_margin.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::MARGIN_RIGHT]
+            .copy_from_slice(&outer_margin.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::MARGIN_TOP].copy_from_slice(&outer_margin.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::MARGIN_BOTTOM]
+            .copy_from_slice(&outer_margin.to_le_bytes());
+        raw_ctrl_data[common_obj_offsets::INSTANCE_ID].copy_from_slice(&instance_id.to_le_bytes());
+
+        let mut table = Table {
+            attr: 0x082A2210,
+            row_count: rows,
+            col_count: cols,
+            cell_spacing: 0,
+            padding: crate::model::Padding {
+                left: 510,
+                right: 510,
+                top: 141,
+                bottom: 141,
+            },
+            row_sizes,
+            border_fill_id: cell_border_fill_id,
+            zones: Vec::new(),
+            cells,
+            cell_grid: Vec::new(),
+            page_break: TablePageBreak::None,
+            repeat_header: false,
+            caption: None,
+            common: crate::model::shape::CommonObjAttr {
+                instance_id,
+                treat_as_char: false,
+                text_wrap: crate::model::shape::TextWrap::TopAndBottom,
+                vert_rel_to: crate::model::shape::VertRelTo::Para,
+                horz_rel_to: crate::model::shape::HorzRelTo::Para,
+                vert_align: crate::model::shape::VertAlign::Top,
+                horz_align: crate::model::shape::HorzAlign::Left,
+                width: total_width,
+                height: total_height,
+                ..Default::default()
+            },
+            outer_margin_left: 283,
+            outer_margin_right: 283,
+            outer_margin_top: 283,
+            outer_margin_bottom: 283,
+            raw_ctrl_data,
+            raw_ctrl_seal: None,
+            raw_table_record_attr: 0x00000006,
+            // [#3570] 한컴은 TABLE 레코드를 zone 개수까지만 쓴다 — 여분 2바이트 없음.
+            raw_table_record_extra: Vec::new(),
+        };
+        table.rebuild_grid();
+
+        // 6) 표를 담은 문단.
+        let mut table_raw_header_extra = vec![0u8; 10];
+        table_raw_header_extra[0..2].copy_from_slice(&1u16.to_le_bytes());
+        table_raw_header_extra[4..6].copy_from_slice(&1u16.to_le_bytes());
+        // 표 문단 line_height 를 중첩 표 전체 높이로 — 셀이 표만큼 세로 공간을 예약해야
+        // 셀 안에서 culling 되지 않고 렌더된다(이미지 문단이 그림 높이를 쓰는 것과 동일).
+        let table_line_h = (total_height as i32).max(1000);
+        let table_para = Paragraph {
+            text: String::new(),
+            char_count: 9,
+            control_mask: 0x00000800,
+            char_offsets: vec![],
+            char_shapes: vec![CharShapeRef {
+                start_pos: 0,
+                char_shape_id: default_char_shape_id,
+            }],
+            line_segs: vec![LineSeg {
+                text_start: 0,
+                line_height: table_line_h,
+                text_height: table_line_h,
+                baseline_distance: (table_line_h * 850) / 1000,
+                line_spacing: 600,
+                segment_width: 0,
+                tag: LineSeg::TAG_SINGLE_SEGMENT_LINE,
+                ..Default::default()
+            }],
+            para_shape_id: default_para_shape_id,
+            style_id: 0,
+            controls: vec![Control::Table(Box::new(table))],
+            ctrl_data_records: vec![None],
+            has_para_text: true,
+            raw_header_extra: table_raw_header_extra,
+            char_count_msb: false,
+            ..Default::default()
+        };
+
+        // 7) 부모 셀에 삽입 + 셀 문단 vpos 사다리 재연결.
+        let at = {
+            let cell = self.get_cell_mut(section_idx, parent_para_idx, control_idx, cell_idx)?;
+            let at = cell_para_idx.min(cell.paragraphs.len());
+            cell.paragraphs.insert(at, table_para);
+            at
+        };
+        self.recalculate_cell_paragraph_vpos_native(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            at,
+            Some(at),
+        );
+        self.mark_cell_control_dirty(section_idx, parent_para_idx, control_idx);
+        self.document.sections[section_idx].raw_stream = None;
+        self.mark_section_dirty(section_idx);
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+        Ok(crate::document_core::helpers::json_ok_with("\"ok\":true"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::document_core::DocumentCore;

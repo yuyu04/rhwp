@@ -1926,6 +1926,305 @@ impl DocumentCore {
     }
 }
 
+/// 인코딩된 이미지(PNG/JPEG/GIF/BMP)의 실제 픽셀 크기를 헤더에서 읽는다.
+/// crop(원본 소스 사각형)을 실제 해상도와 일치시키는 데 쓰인다 — 표시 크기(extent)를
+/// crop으로 쓰면 고해상도 이미지가 렌더 시 1:1로 그려져 박스를 넘친다.
+/// (renderer/svg.rs::parse_image_dimensions 와 동일 로직, document_core 계층 자족용.)
+pub(super) fn decode_image_px(data: &[u8]) -> Option<(u32, u32)> {
+    if data.len() < 24 {
+        return None;
+    }
+    // PNG: IHDR (바이트 16-23)
+    if data.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+        let h = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    // JPEG: SOF 마커
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        let mut i = 2;
+        while i + 9 < data.len() {
+            if data[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = data[i + 1];
+            if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC
+            {
+                let h = u16::from_be_bytes([data[i + 5], data[i + 6]]) as u32;
+                let w = u16::from_be_bytes([data[i + 7], data[i + 8]]) as u32;
+                if w > 0 && h > 0 {
+                    return Some((w, h));
+                }
+            }
+            let seg_len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+            i += 2 + seg_len;
+        }
+    }
+    // GIF: 바이트 6-9
+    if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        let w = u16::from_le_bytes([data[6], data[7]]) as u32;
+        let h = u16::from_le_bytes([data[8], data[9]]) as u32;
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    // BMP: 바이트 18-25
+    if data.starts_with(&[0x42, 0x4D]) && data.len() >= 26 {
+        let w = u32::from_le_bytes([data[18], data[19], data[20], data[21]]);
+        let h = i32::from_le_bytes([data[22], data[23], data[24], data[25]]).unsigned_abs();
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    None
+}
+
+/// [hop fork] 양식 문서 후처리용 셀 그림 연산.
+impl DocumentCore {
+    /// 표 셀 안에 그림을 넣는다(insert_picture_native의 셀 버전). 그림 한 컨트롤을 담은 새
+    /// 문단을 셀의 paragraphs[cell_para_idx] 위치에 삽입한다(글자처럼 취급 인라인 그림).
+    /// BinData 등록은 본문 버전과 같은 `register_embedded_bin_data` 규칙을 쓰고, 삽입 대상만
+    /// 섹션 문단 → 셀 문단으로 바뀐다.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_picture_in_cell_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+    ) -> Result<String, HwpError> {
+        use crate::model::image::{CropInfo, ImageAttr, ImageEffect, Picture};
+        use crate::model::paragraph::{CharShapeRef, LineSeg};
+        use crate::model::shape::{CommonObjAttr, HorzRelTo, ShapeComponentAttr, VertRelTo};
+
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과 (총 {}개)",
+                section_idx,
+                self.document.sections.len()
+            )));
+        }
+        if image_data.is_empty() {
+            return Err(HwpError::RenderError(
+                "이미지 데이터가 비어 있습니다".to_string(),
+            ));
+        }
+        // 실제 이미지 픽셀 크기 디코드. 표시 높이는 이 실제 비율로 폭에서 산출한다 —
+        // 렌더러가 crop(=실제 비율)로 그림을 그리므로, 전달된 height(docx extent 비율)를
+        // 그대로 두면 (1) 세로로 늘어나는 왜곡 (2) 예약 높이>실제 높이라 그림 아래 빈
+        // 간격(캡션이 멀어 보임)이 생긴다. height 를 실제 비율로 맞춰 둘 다 없앤다.
+        let (src_w_px, src_h_px) =
+            decode_image_px(image_data).unwrap_or((natural_width_px, natural_height_px));
+        let mut width = width;
+        let mut height = if src_w_px > 0 {
+            ((width as u64 * src_h_px as u64) / src_w_px as u64) as u32
+        } else {
+            height
+        };
+        // 대상 셀의 기본 문단/글자 모양 + 셀 높이를 읽는다(삽입 문단이 상속, 높이 상한용).
+        let (default_char_shape_id, default_para_shape_id, cell_h_hu) = {
+            let cell = self.get_cell_mut(section_idx, parent_para_idx, control_idx, cell_idx)?;
+            let base = cell.paragraphs.first();
+            (
+                base.and_then(|p| p.char_shapes.first().map(|c| c.char_shape_id))
+                    .unwrap_or(0),
+                base.map(|p| p.para_shape_id).unwrap_or(0),
+                cell.height,
+            )
+        };
+        // 세로로 긴 그림이 셀을 넘쳐 잘리지 않게 높이 상한을 둔다(부모 셀 높이의 60%).
+        // 폭만 98% 로 키우면 긴 그림은 폭×비율 높이가 셀을 넘는다 — 이때 비율 유지하며 축소.
+        // 30% 상한은 일반 가로 그림(높이/폭 ~0.4-0.65)까지 일괄 축소해 "그림이 작다"는
+        // 회귀를 만들었다(2026-07 연구노트 실측: 9개 중 5개 클램프). 60%면 통상 그림은
+        // 원 비율 그대로 셀 폭을 채우고, 세로로 극단적으로 긴 그림만 축소된다.
+        let max_h = (cell_h_hu * 60 / 100).max(7500);
+        if height > max_h && src_h_px > 0 {
+            width = ((max_h as u64 * src_w_px as u64) / src_h_px as u64) as u32;
+            height = max_h;
+        }
+
+        // --- BinData (본문 insert_picture_native 와 같은 등록 규칙) ---
+        let bin_data_id = self.register_embedded_bin_data(image_data, extension);
+
+        // --- Picture (글자처럼 취급 인라인) ---
+        let common_attr: u32 = 0x01 | (2 << 3) | (2 << 8) | (4 << 15) | (2 << 18);
+        let common = CommonObjAttr {
+            ctrl_id: 0x67736F20,
+            attr: common_attr,
+            treat_as_char: true,
+            vert_rel_to: VertRelTo::Para,
+            horz_rel_to: HorzRelTo::Column,
+            width,
+            height,
+            z_order: 0,
+            description: description.to_string(),
+            ..Default::default()
+        };
+        // crop(원본 소스 사각형)·original·border 는 이미지의 실제 픽셀 해상도(×75)로 맞춘다.
+        // 한컴 정품은 border 에 '원본(자연)' 크기를 넣는다(common/current 는 표시 크기로
+        // 별개). 박스(width/height)를 넣으면 한컴이 원본보다 작은 폴리곤으로 보고 그림을
+        // 축소(예: 1/4)해 그린다. img_dim 도 같은 좌표 범위로 남겨 HWP5 저장→재파싱 IR 과
+        // 어긋나지 않게 한다(insert_picture_native 의 #3719 §6-5 정합).
+        let orig_w = src_w_px * 75;
+        let orig_h = src_h_px * 75;
+        let shape_attr = ShapeComponentAttr {
+            original_width: orig_w,
+            original_height: orig_h,
+            current_width: width,
+            current_height: height,
+            local_file_version: 1,
+            render_sx: 1.0,
+            render_sy: 1.0,
+            ..Default::default()
+        };
+        let bx = [0i32, 0, orig_w as i32, 0];
+        let by = [orig_w as i32, orig_h as i32, 0, orig_h as i32];
+        let crop = CropInfo {
+            left: 0,
+            top: 0,
+            right: orig_w as i32,
+            bottom: orig_h as i32,
+        };
+        let pic = Picture {
+            common,
+            shape_attr,
+            border_x: bx,
+            border_y: by,
+            crop,
+            img_dim: (orig_w, orig_h),
+            image_attr: ImageAttr {
+                bin_data_id,
+                brightness: 0,
+                contrast: 0,
+                effect: ImageEffect::RealPic,
+                transparency: 0,
+                external_path: None,
+            },
+            ..Default::default()
+        };
+
+        // --- 그림 문단(본문 인라인 그림과 같은 형태). segment_width는 그림 폭. ---
+        let mut pic_raw_header_extra = vec![0u8; 10];
+        pic_raw_header_extra[0..2].copy_from_slice(&1u16.to_le_bytes());
+        pic_raw_header_extra[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let pic_para = Paragraph {
+            text: String::new(),
+            char_count: 9,
+            control_mask: 0x00000800,
+            char_offsets: vec![],
+            char_shapes: vec![CharShapeRef {
+                start_pos: 0,
+                char_shape_id: default_char_shape_id,
+            }],
+            line_segs: vec![LineSeg {
+                text_start: 0,
+                line_height: height as i32,
+                text_height: height as i32,
+                baseline_distance: (height as i32 * 850) / 1000,
+                line_spacing: 600,
+                segment_width: width as i32,
+                tag: LineSeg::TAG_SINGLE_SEGMENT_LINE,
+                ..Default::default()
+            }],
+            para_shape_id: default_para_shape_id,
+            style_id: 0,
+            controls: vec![Control::Picture(Box::new(pic))],
+            ctrl_data_records: vec![None],
+            has_para_text: true,
+            raw_header_extra: pic_raw_header_extra,
+            char_count_msb: false,
+            ..Default::default()
+        };
+
+        // --- 셀 문단 목록에 삽입 ---
+        let at = {
+            let cell = self.get_cell_mut(section_idx, parent_para_idx, control_idx, cell_idx)?;
+            let at = cell_para_idx.min(cell.paragraphs.len());
+            cell.paragraphs.insert(at, pic_para);
+            at
+        };
+        // 그림 문단 삽입으로 뒤 문단들의 셀 내 Y 오프셋이 밀린다. 셀 문단 vpos 사다리를
+        // 삽입 지점부터 다시 잇는다(새 문단의 vpos=0 은 경계 리셋이 아니라 placeholder).
+        self.recalculate_cell_paragraph_vpos_native(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            at,
+            Some(at),
+        );
+        self.mark_cell_control_dirty(section_idx, parent_para_idx, control_idx);
+        self.document.sections[section_idx].raw_stream = None;
+        self.mark_section_dirty(section_idx);
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+        self.event_log.push(DocumentEvent::PictureInserted {
+            section: section_idx,
+            para: parent_para_idx,
+        });
+        Ok(crate::document_core::helpers::json_ok_with("\"ok\":true"))
+    }
+
+    /// 모든 그림의 border_x/border_y(4모서리)를 '원본 크기'로 바로잡는다.
+    ///
+    /// 한컴 정품 그림은 border에 원본(자연) 크기를 넣는데, 과거 삽입 코드가 박스(표시) 크기를
+    /// 넣어 한컴에서 그림이 1/4로 축소돼 그려졌다(hop은 common으로 그려 정상). 이미 만들어진
+    /// 파일의 그림들을 shape_attr.original_width/height 기준으로 일괄 교정한다. 셀 안 그림도
+    /// 재귀 처리. border_x/y는 직렬화가 모델에서 재생성하므로 raw 보정은 불필요.
+    pub fn fix_picture_borders_native(&mut self) -> Result<String, HwpError> {
+        fn fix(paras: &mut [Paragraph]) -> usize {
+            let mut n = 0;
+            for p in paras.iter_mut() {
+                for ctrl in p.controls.iter_mut() {
+                    match ctrl {
+                        Control::Picture(pic) => {
+                            let ow = pic.shape_attr.original_width as i32;
+                            let oh = pic.shape_attr.original_height as i32;
+                            if ow > 0 && oh > 0 {
+                                pic.border_x = [0, 0, ow, 0];
+                                pic.border_y = [ow, oh, 0, oh];
+                                n += 1;
+                            }
+                        }
+                        Control::Table(t) => {
+                            for cell in t.cells.iter_mut() {
+                                n += fix(&mut cell.paragraphs);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            n
+        }
+        let mut total = 0;
+        for si in 0..self.document.sections.len() {
+            let c = fix(&mut self.document.sections[si].paragraphs);
+            if c > 0 {
+                self.document.sections[si].raw_stream = None;
+                self.mark_section_dirty(si);
+            }
+            total += c;
+        }
+        Ok(crate::document_core::helpers::json_ok_with(&format!(
+            "\"fixed\":{}",
+            total
+        )))
+    }
+}
+
 #[cfg(test)]
 mod issue_1151_cell_picture_insert_tests {
     //! Issue #1151: 표 셀 안 이미지 삽입이 항상 표 밖 본문 문단에 들어가는 결함.
